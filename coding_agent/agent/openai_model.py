@@ -1,0 +1,319 @@
+from __future__ import annotations
+
+import json
+import os
+import ssl
+import urllib.error
+import urllib.request
+from pathlib import Path
+from typing import Any, Dict, Iterable, List, Optional, Sequence
+
+from .model_client import ModelClient
+from .models import (
+    AssistantMessage,
+    AttachmentMessage,
+    Message,
+    ToolUseBlock,
+    UserMessage,
+    new_uuid,
+    text_block,
+)
+from .tools import Tool
+
+
+class OpenAICompatibleModelClient(ModelClient):
+    """OpenAI-compatible chat completions adapter.
+
+    Environment variables:
+    - LLM_API_KEY
+    - LLM_MODEL_ID
+    - LLM_BASE_URL
+
+    The adapter maps this project's internal Claude-style `tool_use` blocks to
+    OpenAI-style `tool_calls`, then maps model `tool_calls` back to internal
+    `ToolUseBlock` objects so QueryLoop can stay provider-agnostic.
+    """
+
+    def __init__(
+        self,
+        api_key: str,
+        model_id: str,
+        base_url: str,
+        timeout_seconds: float = 60.0,
+    ):
+        self.api_key = api_key
+        self.model_id = model_id
+        self.base_url = base_url
+        self.timeout_seconds = timeout_seconds
+        self.chat_completions_url = normalize_chat_completions_url(base_url)
+        self.ssl_context = create_ssl_context()
+
+    @classmethod
+    def from_env(
+        cls,
+        env_file: Optional[Path] = None,
+        timeout_seconds: Optional[float] = None,
+    ) -> "OpenAICompatibleModelClient":
+        load_env_file(env_file)
+        api_key = os.environ.get("LLM_API_KEY")
+        model_id = os.environ.get("LLM_MODEL_ID")
+        base_url = os.environ.get("LLM_BASE_URL")
+        missing = [
+            name
+            for name, value in (
+                ("LLM_API_KEY", api_key),
+                ("LLM_MODEL_ID", model_id),
+                ("LLM_BASE_URL", base_url),
+            )
+            if not value
+        ]
+        if missing:
+            raise ValueError("Missing LLM environment variable(s): %s" % ", ".join(missing))
+
+        if timeout_seconds is None:
+            timeout_raw = os.environ.get("LLM_TIMEOUT_SECONDS")
+            timeout_seconds = float(timeout_raw) if timeout_raw else 60.0
+
+        return cls(
+            api_key=str(api_key),
+            model_id=str(model_id),
+            base_url=str(base_url),
+            timeout_seconds=timeout_seconds,
+        )
+
+    async def stream(
+        self,
+        messages: Sequence[Message],
+        tools: Sequence[Tool],
+        system_prompt: str,
+    ):
+        payload = {
+            "model": self.model_id,
+            "messages": to_openai_messages(messages, system_prompt),
+            "tools": [tool_to_openai_schema(tool) for tool in tools],
+            "tool_choice": "auto",
+        }
+        data = self._post_chat_completion(payload)
+        yield assistant_from_openai_response(data)
+
+    def _post_chat_completion(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        request = urllib.request.Request(
+            self.chat_completions_url,
+            data=body,
+            headers={
+                "Authorization": "Bearer %s" % self.api_key,
+                "Content-Type": "application/json",
+            },
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(
+                request,
+                timeout=self.timeout_seconds,
+                context=self.ssl_context,
+            ) as response:
+                response_body = response.read().decode("utf-8")
+        except urllib.error.HTTPError as exc:
+            error_body = exc.read().decode("utf-8", errors="replace")
+            raise RuntimeError(
+                "LLM request failed with HTTP %s: %s" % (exc.code, error_body)
+            )
+        except urllib.error.URLError as exc:
+            raise RuntimeError("LLM request failed: %s" % exc)
+
+        try:
+            return json.loads(response_body)
+        except json.JSONDecodeError as exc:
+            raise RuntimeError("LLM response was not valid JSON: %s" % exc)
+
+
+def create_ssl_context() -> ssl.SSLContext:
+    if os.environ.get("LLM_SKIP_SSL_VERIFY") == "1":
+        return ssl._create_unverified_context()
+
+    try:
+        import certifi
+
+        return ssl.create_default_context(cafile=certifi.where())
+    except Exception:
+        return ssl.create_default_context()
+
+
+def normalize_chat_completions_url(base_url: str) -> str:
+    base = base_url.rstrip("/")
+    if base.endswith("/chat/completions"):
+        return base
+    if base.endswith("/v1"):
+        return base + "/chat/completions"
+    return base + "/v1/chat/completions"
+
+
+def load_env_file(env_file: Optional[Path] = None) -> Optional[Path]:
+    path = find_env_file(env_file)
+    if path is None:
+        return None
+
+    for raw_line in path.read_text(encoding="utf-8").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        key = key.strip()
+        value = value.strip().strip('"').strip("'")
+        if key and key not in os.environ:
+            os.environ[key] = value
+    return path
+
+
+def find_env_file(env_file: Optional[Path] = None) -> Optional[Path]:
+    if env_file is not None:
+        path = Path(env_file)
+        return path if path.exists() else None
+
+    module_dir = Path(__file__).resolve().parent
+    candidates: List[Path] = [
+        Path.cwd() / ".env",
+        module_dir / ".env",
+        module_dir.parent / ".env",
+    ]
+    candidates.extend(parent / ".env" for parent in Path.cwd().resolve().parents)
+
+    seen = set()
+    for candidate in candidates:
+        resolved = candidate.resolve()
+        if resolved in seen:
+            continue
+        seen.add(resolved)
+        if resolved.exists():
+            return resolved
+    return None
+
+
+def tool_to_openai_schema(tool: Tool) -> Dict[str, Any]:
+    return {
+        "type": "function",
+        "function": {
+            "name": tool.name,
+            "description": tool.description,
+            "parameters": tool.input_schema,
+        },
+    }
+
+
+def to_openai_messages(messages: Sequence[Message], system_prompt: str) -> List[Dict[str, Any]]:
+    result: List[Dict[str, Any]] = [{"role": "system", "content": system_prompt}]
+    for message in messages:
+        if isinstance(message, AssistantMessage):
+            result.append(assistant_to_openai_message(message))
+        elif isinstance(message, UserMessage):
+            result.extend(user_to_openai_messages(message))
+        elif isinstance(message, AttachmentMessage):
+            result.append({"role": "user", "content": repr(message.attachment)})
+    return result
+
+
+def assistant_to_openai_message(message: AssistantMessage) -> Dict[str, Any]:
+    text_parts: List[str] = []
+    tool_calls: List[Dict[str, Any]] = []
+    for block in message.content:
+        if block.get("type") == "text":
+            text_parts.append(str(block.get("text", "")))
+        elif block.get("type") == "tool_use":
+            tool_use = ToolUseBlock.from_block(block)
+            tool_calls.append(
+                {
+                    "id": tool_use.id,
+                    "type": "function",
+                    "function": {
+                        "name": tool_use.name,
+                        "arguments": json.dumps(tool_use.input, ensure_ascii=False),
+                    },
+                }
+            )
+
+    openai_message: Dict[str, Any] = {
+        "role": "assistant",
+        "content": "\n".join(part for part in text_parts if part) or None,
+    }
+    if tool_calls:
+        openai_message["tool_calls"] = tool_calls
+    return openai_message
+
+
+def user_to_openai_messages(message: UserMessage) -> List[Dict[str, Any]]:
+    if isinstance(message.content, str):
+        return [{"role": "user", "content": message.content}]
+
+    result: List[Dict[str, Any]] = []
+    text_parts: List[str] = []
+    for block in message.content:
+        if block.get("type") == "tool_result":
+            if text_parts:
+                result.append({"role": "user", "content": "\n".join(text_parts)})
+                text_parts = []
+            result.append(
+                {
+                    "role": "tool",
+                    "tool_call_id": str(block.get("tool_use_id")),
+                    "content": str(block.get("content", "")),
+                }
+            )
+        elif block.get("type") == "text":
+            text_parts.append(str(block.get("text", "")))
+        else:
+            text_parts.append(json.dumps(block, ensure_ascii=False))
+
+    if text_parts:
+        result.append({"role": "user", "content": "\n".join(text_parts)})
+    return result
+
+
+def assistant_from_openai_response(data: Dict[str, Any]) -> AssistantMessage:
+    choices = data.get("choices") or []
+    if not choices:
+        raise RuntimeError("LLM response did not include choices")
+
+    choice = choices[0]
+    message = choice.get("message") or {}
+    finish_reason = choice.get("finish_reason")
+    content_blocks = []
+
+    content = message.get("content")
+    if content:
+        content_blocks.append(text_block(str(content)))
+
+    for tool_call in message.get("tool_calls") or []:
+        function = tool_call.get("function") or {}
+        content_blocks.append(
+            ToolUseBlock(
+                id=str(tool_call.get("id") or "toolu_" + new_uuid().replace("-", "")[:12]),
+                name=str(function.get("name") or ""),
+                input=parse_tool_arguments(function.get("arguments")),
+            ).to_block()
+        )
+
+    if not content_blocks:
+        content_blocks.append(text_block(""))
+
+    return AssistantMessage(
+        content=content_blocks,
+        model=str(data.get("model") or "openai-compatible"),
+        stop_reason="tool_use" if message.get("tool_calls") else finish_reason,
+    )
+
+
+def parse_tool_arguments(arguments: Any) -> Dict[str, Any]:
+    if isinstance(arguments, dict):
+        return arguments
+    if arguments is None:
+        return {}
+    if not isinstance(arguments, str):
+        return {"_raw_arguments": arguments}
+    try:
+        parsed = json.loads(arguments)
+    except json.JSONDecodeError:
+        return {"_raw_arguments": arguments}
+    if isinstance(parsed, dict):
+        return parsed
+    return {"_raw_arguments": parsed}

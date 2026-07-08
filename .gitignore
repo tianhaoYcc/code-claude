@@ -1,0 +1,17 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+.env
+*.env
+.idea/
+
+coding_agent/.agent_outputs/
+coding_agent/.agent_sessions/
+coding_agent/.agent_tmp/
+coding_agent/IMPROVEMENT_CHECKLIST.md
+**/.agent_outputs/
+**/.agent_sessions/
+**/.agent_tmp/
