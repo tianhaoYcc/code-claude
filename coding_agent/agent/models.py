@@ -35,10 +35,15 @@ class ToolUseBlock:
 
     @classmethod
     def from_block(cls, block: ContentBlock) -> "ToolUseBlock":
+        raw_input = block.get("input") or {}
+        if isinstance(raw_input, dict):
+            input_data = dict(raw_input)
+        else:
+            input_data = {"_raw_arguments": raw_input}
         return cls(
             id=str(block["id"]),
             name=str(block["name"]),
-            input=dict(block.get("input") or {}),
+            input=input_data,
         )
 
 

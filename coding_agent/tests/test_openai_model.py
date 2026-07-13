@@ -9,6 +9,7 @@ from agent.openai_model import (
     OpenAICompatibleModelClient,
     assistant_from_openai_response,
     normalize_chat_completions_url,
+    parse_tool_arguments,
     to_openai_messages,
     tool_to_openai_schema,
 )
@@ -105,6 +106,17 @@ class OpenAIModelTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(tool_use.id, "call_1")
         self.assertEqual(tool_use.name, "read_file")
         self.assertEqual(tool_use.input, {"file_path": "README.md"})
+
+    def test_malformed_tool_arguments_are_repaired_when_possible(self):
+        self.assertEqual(parse_tool_arguments('{}{"path": "."}'), {"path": "."})
+        self.assertEqual(
+            parse_tool_arguments('```json\n{"file_path": "README.md"}\n```'),
+            {"file_path": "README.md"},
+        )
+        self.assertEqual(
+            parse_tool_arguments("not json"),
+            {"_raw_arguments": "not json"},
+        )
 
     async def test_client_sends_tools_and_returns_internal_assistant(self):
         response = {

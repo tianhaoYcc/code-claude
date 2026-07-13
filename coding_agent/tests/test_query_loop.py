@@ -120,6 +120,41 @@ class QueryLoopTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertIn("Missing required field", last_tool_result_text(loop.messages))
 
+    async def test_schema_error_can_be_retried_with_corrected_arguments(self):
+        model = ScriptedModelClient(
+            [
+                AssistantMessage.tool_use("read_file", {}),
+                AssistantMessage.tool_use("read_file", {"path": "hello.txt"}),
+                AssistantMessage.text("done"),
+            ]
+        )
+        loop = QueryLoop(model, self.workspace)
+
+        events = await collect_events(loop, "retry bad schema")
+
+        self.assertEqual(model.calls, 3)
+        self.assertIn("beta needle", last_tool_result_text(loop.messages))
+        self.assertEqual(events[-1].reason, "completed")
+
+    async def test_bad_tool_arguments_stop_after_limit(self):
+        model = ScriptedModelClient(
+            [
+                AssistantMessage.tool_use("read_file", {}),
+                AssistantMessage.tool_use("read_file", {}),
+                AssistantMessage.text("should not be reached"),
+            ]
+        )
+        loop = QueryLoop(
+            model,
+            self.workspace,
+            config=QueryLoopConfig(max_bad_tool_input_attempts=2, max_turns=5),
+        )
+
+        events = await collect_events(loop, "repeat bad schema")
+
+        self.assertEqual(model.calls, 2)
+        self.assertEqual(events[-1].reason, "bad_tool_arguments")
+
     async def test_path_outside_workspace_is_denied(self):
         outside = self.workspace.parent / "outside.txt"
         outside.write_text("secret", encoding="utf-8")
@@ -134,6 +169,118 @@ class QueryLoopTests(unittest.IsolatedAsyncioTestCase):
         await collect_events(loop, "read outside")
 
         self.assertIn("outside workspace", last_tool_result_text(loop.messages))
+
+    async def test_read_permission_can_deny_read_file(self):
+        model = ScriptedModelClient(
+            [
+                AssistantMessage.tool_use("read_file", {"file_path": "hello.txt"}),
+                AssistantMessage.text("done"),
+            ]
+        )
+        loop = QueryLoop(
+            model,
+            self.workspace,
+            config=QueryLoopConfig(read_permission="deny"),
+        )
+
+        await collect_events(loop, "read denied")
+
+        self.assertIn("Permission denied", last_tool_result_text(loop.messages))
+
+    async def test_write_file_is_denied_by_default(self):
+        model = ScriptedModelClient(
+            [
+                AssistantMessage.tool_use(
+                    "write_file",
+                    {"file_path": "new.txt", "content": "created\n"},
+                ),
+                AssistantMessage.text("done"),
+            ]
+        )
+        loop = QueryLoop(model, self.workspace)
+
+        await collect_events(loop, "write denied")
+
+        self.assertFalse((self.workspace / "new.txt").exists())
+        self.assertIn("Permission denied", last_tool_result_text(loop.messages))
+
+    async def test_write_file_writes_and_returns_diff_when_allowed(self):
+        model = ScriptedModelClient(
+            [
+                AssistantMessage.tool_use(
+                    "write_file",
+                    {"file_path": "new.txt", "content": "created\n"},
+                ),
+                AssistantMessage.text("done"),
+            ]
+        )
+        loop = QueryLoop(
+            model,
+            self.workspace,
+            config=QueryLoopConfig(write_permission="allow"),
+        )
+
+        await collect_events(loop, "write allowed")
+        result_text = last_tool_result_text(loop.messages)
+
+        self.assertEqual((self.workspace / "new.txt").read_text(encoding="utf-8"), "created\n")
+        self.assertIn("Wrote file:", result_text)
+        self.assertIn("+created", result_text)
+
+    async def test_write_file_requires_overwrite_for_existing_file(self):
+        model = ScriptedModelClient(
+            [
+                AssistantMessage.tool_use(
+                    "write_file",
+                    {"file_path": "hello.txt", "content": "replacement\n"},
+                ),
+                AssistantMessage.text("done"),
+            ]
+        )
+        loop = QueryLoop(
+            model,
+            self.workspace,
+            config=QueryLoopConfig(write_permission="allow"),
+        )
+
+        await collect_events(loop, "overwrite denied")
+
+        self.assertIn(
+            "File already exists and overwrite=false",
+            last_tool_result_text(loop.messages),
+        )
+        self.assertIn(
+            "beta needle",
+            (self.workspace / "hello.txt").read_text(encoding="utf-8"),
+        )
+
+    async def test_edit_file_edits_and_returns_diff_when_allowed(self):
+        model = ScriptedModelClient(
+            [
+                AssistantMessage.tool_use(
+                    "edit_file",
+                    {
+                        "file_path": "hello.txt",
+                        "old_text": "beta needle",
+                        "new_text": "BETA needle",
+                    },
+                ),
+                AssistantMessage.text("done"),
+            ]
+        )
+        loop = QueryLoop(
+            model,
+            self.workspace,
+            config=QueryLoopConfig(write_permission="allow"),
+        )
+
+        await collect_events(loop, "edit allowed")
+        result_text = last_tool_result_text(loop.messages)
+
+        self.assertIn("BETA needle", (self.workspace / "hello.txt").read_text(encoding="utf-8"))
+        self.assertIn("Edited file:", result_text)
+        self.assertIn("-beta needle", result_text)
+        self.assertIn("+BETA needle", result_text)
 
     async def test_max_turns_stops_before_next_model_call(self):
         model = ScriptedModelClient(

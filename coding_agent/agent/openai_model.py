@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import ssl
+import ast
 import urllib.error
 import urllib.request
 from pathlib import Path
@@ -310,10 +311,72 @@ def parse_tool_arguments(arguments: Any) -> Dict[str, Any]:
         return {}
     if not isinstance(arguments, str):
         return {"_raw_arguments": arguments}
+
+    repaired = parse_jsonish_object(arguments)
+    if repaired is not None:
+        return repaired
+    return {"_raw_arguments": arguments}
+
+
+def parse_jsonish_object(text: str) -> Optional[Dict[str, Any]]:
+    cleaned = strip_json_fence(text.strip())
+    if not cleaned:
+        return {}
+
     try:
-        parsed = json.loads(arguments)
+        parsed = json.loads(cleaned)
     except json.JSONDecodeError:
-        return {"_raw_arguments": arguments}
+        parsed = None
     if isinstance(parsed, dict):
         return parsed
-    return {"_raw_arguments": parsed}
+    if parsed is not None:
+        return None
+
+    try:
+        literal = ast.literal_eval(cleaned)
+    except (ValueError, SyntaxError):
+        literal = None
+    if isinstance(literal, dict):
+        return literal
+
+    repaired_objects = decode_json_objects(cleaned)
+    if not repaired_objects:
+        return None
+
+    merged: Dict[str, Any] = {}
+    for item in repaired_objects:
+        merged.update(item)
+    return merged
+
+
+def strip_json_fence(text: str) -> str:
+    if not text.startswith("```"):
+        return text
+    lines = text.splitlines()
+    if not lines:
+        return text
+    if lines[0].startswith("```"):
+        lines = lines[1:]
+    if lines and lines[-1].strip().startswith("```"):
+        lines = lines[:-1]
+    return "\n".join(lines).strip()
+
+
+def decode_json_objects(text: str) -> List[Dict[str, Any]]:
+    decoder = json.JSONDecoder()
+    objects: List[Dict[str, Any]] = []
+    index = 0
+    while index < len(text):
+        while index < len(text) and text[index] not in "{[":
+            index += 1
+        if index >= len(text):
+            break
+        try:
+            value, end = decoder.raw_decode(text, index)
+        except json.JSONDecodeError:
+            index += 1
+            continue
+        if isinstance(value, dict):
+            objects.append(value)
+        index = max(end, index + 1)
+    return objects

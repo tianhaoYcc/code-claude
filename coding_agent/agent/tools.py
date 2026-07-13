@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import asyncio
+import difflib
 import fnmatch
-import os
-from dataclasses import dataclass
+import functools
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 
 class ToolError(Exception):
@@ -16,6 +18,10 @@ class InputValidationError(ToolError):
 
 
 class PermissionError(ToolError):
+    pass
+
+
+class ToolCancelledError(ToolError):
     pass
 
 
@@ -33,6 +39,59 @@ def _schema_type_matches(value: Any, expected_type: str) -> bool:
     if expected_type == "object":
         return isinstance(value, dict)
     return True
+
+
+def _coerce_schema_value(value: Any, expected_type: Any) -> Any:
+    if isinstance(expected_type, list):
+        for typ in expected_type:
+            try:
+                return _coerce_schema_value(value, typ)
+            except InputValidationError:
+                continue
+        return value
+    if expected_type == "integer" and isinstance(value, str):
+        stripped = value.strip()
+        if stripped and stripped.lstrip("-").isdigit():
+            return int(stripped)
+    if expected_type == "number" and isinstance(value, str):
+        stripped = value.strip()
+        try:
+            return float(stripped)
+        except ValueError:
+            return value
+    if expected_type == "boolean" and isinstance(value, str):
+        lowered = value.strip().lower()
+        if lowered in ("true", "1", "yes", "y"):
+            return True
+        if lowered in ("false", "0", "no", "n"):
+            return False
+    return value
+
+
+def normalize_input(
+    input_schema: Dict[str, Any],
+    data: Dict[str, Any],
+    argument_aliases: Optional[Dict[str, str]] = None,
+) -> Dict[str, Any]:
+    if not isinstance(data, dict):
+        raise InputValidationError("Tool input must be an object")
+    if "_raw_arguments" in data:
+        raise InputValidationError(
+            "Tool arguments were malformed or not a JSON object: %r"
+            % data.get("_raw_arguments")
+        )
+
+    normalized = dict(data)
+    for alias, canonical in (argument_aliases or {}).items():
+        if canonical not in normalized and alias in normalized:
+            normalized[canonical] = normalized[alias]
+
+    properties = input_schema.get("properties") or {}
+    for key, spec in properties.items():
+        if key not in normalized:
+            continue
+        normalized[key] = _coerce_schema_value(normalized[key], spec.get("type"))
+    return normalized
 
 
 def validate_input(input_schema: Dict[str, Any], data: Dict[str, Any]) -> None:
@@ -74,16 +133,128 @@ def resolve_workspace_path(workspace_root: Path, user_path: str) -> Path:
     return resolved
 
 
+async def _run_sync(function: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
+    loop = asyncio.get_running_loop()
+    call = functools.partial(function, *args, **kwargs)
+    return await loop.run_in_executor(None, call)
+
+
+def _list_dir_entries(path: Path, limit: int) -> List[str]:
+    entries: List[str] = []
+    for child in sorted(path.iterdir(), key=lambda item: item.name.lower()):
+        suffix = "/" if child.is_dir() else ""
+        entries.append(child.name + suffix)
+        if len(entries) >= limit:
+            break
+    return entries
+
+
+def _glob_files(base: Path, pattern: str, root: Path, limit: int) -> List[str]:
+    matches: List[str] = []
+    for path in sorted(base.rglob(pattern)):
+        if path.is_file():
+            matches.append(str(path.relative_to(root)))
+            if len(matches) >= limit:
+                break
+    return matches
+
+
+def _grep_files(
+    base: Path,
+    root: Path,
+    pattern: str,
+    file_glob: str,
+    limit: int,
+) -> List[str]:
+    matches: List[str] = []
+    for path in sorted(base.rglob("*")):
+        if len(matches) >= limit:
+            break
+        if not path.is_file() or not fnmatch.fnmatch(path.name, file_glob):
+            continue
+        try:
+            lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+        except OSError:
+            continue
+        for line_no, line in enumerate(lines, start=1):
+            if pattern in line:
+                rel = str(path.relative_to(root))
+                matches.append("%s:%d:%s" % (rel, line_no, line))
+                if len(matches) >= limit:
+                    break
+    return matches
+
+
 @dataclass
 class ToolResult:
     content: str
     raw: Any = None
+    is_error: bool = False
+
+
+@dataclass
+class PermissionRequest:
+    action: str
+    tool_name: str
+    path: Optional[Path] = None
+    description: str = ""
+
+
+PermissionCallback = Callable[[PermissionRequest], bool]
+
+
+@dataclass
+class PermissionPolicy:
+    read: str = "allow"
+    write: str = "deny"
+    shell: str = "deny"
+    callback: Optional[PermissionCallback] = None
+
+    def check(self, request: PermissionRequest) -> None:
+        mode = self.mode_for(request.action)
+        if mode == "allow":
+            return
+        if mode == "deny":
+            raise PermissionError(self._deny_message(request, "denied by policy"))
+        if mode == "ask":
+            if self.callback is None:
+                raise PermissionError(
+                    self._deny_message(request, "ask mode has no callback")
+                )
+            if not self.callback(request):
+                raise PermissionError(self._deny_message(request, "denied by user"))
+            return
+        raise PermissionError(
+            "Unknown permission mode for %s: %s" % (request.action, mode)
+        )
+
+    def mode_for(self, action: str) -> str:
+        if action == "read":
+            return self.read
+        if action == "write":
+            return self.write
+        if action == "shell":
+            return self.shell
+        return "deny"
+
+    def _deny_message(self, request: PermissionRequest, reason: str) -> str:
+        path_text = " path=%s" % request.path if request.path is not None else ""
+        detail = " %s" % request.description if request.description else ""
+        return (
+            "Permission %s for %s action=%s%s%s"
+            % (reason, request.tool_name, request.action, path_text, detail)
+        )
 
 
 class Tool:
     name = ""
     description = ""
     input_schema: Dict[str, Any] = {"type": "object", "properties": {}}
+    argument_aliases: Dict[str, str] = {}
+    permission_action: Optional[str] = None
+
+    def is_enabled(self) -> bool:
+        return True
 
     def is_concurrency_safe(self, input_data: Dict[str, Any]) -> bool:
         return False
@@ -99,8 +270,17 @@ class Tool:
         input_data: Dict[str, Any],
         context: "ToolContext",
     ) -> ToolResult:
-        validate_input(self.input_schema, input_data)
-        return await self.call(input_data, context)
+        normalized = self.prepare_input(input_data)
+        return await self.call(normalized, context)
+
+    def prepare_input(self, input_data: Dict[str, Any]) -> Dict[str, Any]:
+        normalized = normalize_input(
+            self.input_schema,
+            input_data,
+            self.argument_aliases,
+        )
+        validate_input(self.input_schema, normalized)
+        return normalized
 
     def schema_for_model(self) -> Dict[str, Any]:
         return {
@@ -115,14 +295,38 @@ class ToolContext:
     workspace_root: Path
     output_dir: Path
     allow_writes: bool = False
+    permission_policy: PermissionPolicy = field(default_factory=PermissionPolicy)
+    shell_timeout_seconds: int = 30
+    shell_max_output_chars: int = 30000
+    cancel_event: asyncio.Event = field(default_factory=asyncio.Event)
 
     def resolve_path(self, user_path: str) -> Path:
         return resolve_workspace_path(self.workspace_root, user_path)
+
+    def check_permission(
+        self,
+        action: str,
+        tool_name: str,
+        path: Optional[Path] = None,
+        description: str = "",
+    ) -> None:
+        if action == "write" and self.allow_writes:
+            return
+        self.permission_policy.check(
+            PermissionRequest(
+                action=action,
+                tool_name=tool_name,
+                path=path,
+                description=description,
+            )
+        )
 
 
 class ReadFileTool(Tool):
     name = "read_file"
     description = "Read a UTF-8 text file from the workspace"
+    permission_action = "read"
+    argument_aliases = {"path": "file_path", "file": "file_path"}
     input_schema = {
         "type": "object",
         "required": ["file_path"],
@@ -138,6 +342,7 @@ class ReadFileTool(Tool):
 
     async def call(self, input_data: Dict[str, Any], context: ToolContext) -> ToolResult:
         path = context.resolve_path(str(input_data["file_path"]))
+        context.check_permission("read", self.name, path, "read text file")
         if not path.exists():
             raise ToolError("File does not exist: %s" % path)
         if not path.is_file():
@@ -150,7 +355,7 @@ class ReadFileTool(Tool):
         if limit < 1:
             raise InputValidationError("limit must be >= 1")
 
-        text = path.read_text(encoding="utf-8", errors="replace")
+        text = await _run_sync(path.read_text, encoding="utf-8", errors="replace")
         lines = text.splitlines()
         selected = lines[start_line - 1 : start_line - 1 + limit]
         numbered = [
@@ -172,6 +377,7 @@ class ReadFileTool(Tool):
 class ListDirTool(Tool):
     name = "list_dir"
     description = "List files and directories under a workspace path"
+    permission_action = "read"
     input_schema = {
         "type": "object",
         "properties": {
@@ -187,16 +393,12 @@ class ListDirTool(Tool):
         rel_path = str(input_data.get("path") or ".")
         limit = int(input_data.get("limit") or 200)
         path = context.resolve_path(rel_path)
+        context.check_permission("read", self.name, path, "list directory")
         if not path.exists():
             raise ToolError("Path does not exist: %s" % path)
         if not path.is_dir():
             raise ToolError("Path is not a directory: %s" % path)
-        entries = []
-        for child in sorted(path.iterdir(), key=lambda item: item.name.lower()):
-            suffix = "/" if child.is_dir() else ""
-            entries.append(child.name + suffix)
-            if len(entries) >= limit:
-                break
+        entries = await _run_sync(_list_dir_entries, path, limit)
         return ToolResult(
             content="Directory: %s\n%s" % (path, "\n".join(entries)),
             raw={"path": str(path), "entries": entries},
@@ -206,6 +408,7 @@ class ListDirTool(Tool):
 class GlobTool(Tool):
     name = "glob"
     description = "Find workspace files matching a glob pattern"
+    permission_action = "read"
     input_schema = {
         "type": "object",
         "required": ["pattern"],
@@ -223,14 +426,16 @@ class GlobTool(Tool):
         base = context.resolve_path(str(input_data.get("path") or "."))
         pattern = str(input_data["pattern"])
         limit = int(input_data.get("limit") or 200)
+        context.check_permission("read", self.name, base, "glob files")
         if not base.exists() or not base.is_dir():
             raise ToolError("Search path is not a directory: %s" % base)
-        matches = []
-        for path in sorted(base.rglob(pattern)):
-            if path.is_file():
-                matches.append(str(path.relative_to(context.workspace_root.resolve())))
-                if len(matches) >= limit:
-                    break
+        matches = await _run_sync(
+            _glob_files,
+            base,
+            pattern,
+            context.workspace_root.resolve(),
+            limit,
+        )
         return ToolResult(
             content="Glob pattern: %s\n%s" % (pattern, "\n".join(matches)),
             raw={"pattern": pattern, "matches": matches},
@@ -240,6 +445,7 @@ class GlobTool(Tool):
 class GrepTool(Tool):
     name = "grep"
     description = "Search text files in the workspace"
+    permission_action = "read"
     input_schema = {
         "type": "object",
         "required": ["pattern"],
@@ -259,34 +465,156 @@ class GrepTool(Tool):
         pattern = str(input_data["pattern"])
         file_glob = str(input_data.get("glob") or "*")
         limit = int(input_data.get("limit") or 100)
+        context.check_permission("read", self.name, base, "grep files")
         if not base.exists() or not base.is_dir():
             raise ToolError("Search path is not a directory: %s" % base)
 
-        root = context.workspace_root.resolve()
-        matches: List[str] = []
-        for path in sorted(base.rglob("*")):
-            if len(matches) >= limit:
-                break
-            if not path.is_file() or not fnmatch.fnmatch(path.name, file_glob):
-                continue
-            try:
-                lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
-            except OSError:
-                continue
-            for line_no, line in enumerate(lines, start=1):
-                if pattern in line:
-                    rel = str(path.relative_to(root))
-                    matches.append("%s:%d:%s" % (rel, line_no, line))
-                    if len(matches) >= limit:
-                        break
+        matches = await _run_sync(
+            _grep_files,
+            base,
+            context.workspace_root.resolve(),
+            pattern,
+            file_glob,
+            limit,
+        )
         return ToolResult(
             content="Grep pattern: %s\n%s" % (pattern, "\n".join(matches)),
             raw={"pattern": pattern, "matches": matches},
         )
 
 
+def make_unified_diff(old_text: str, new_text: str, path: Path) -> str:
+    diff_lines = list(
+        difflib.unified_diff(
+            old_text.splitlines(),
+            new_text.splitlines(),
+            fromfile=str(path) + " (before)",
+            tofile=str(path) + " (after)",
+            lineterm="",
+        )
+    )
+    return "\n".join(diff_lines) if diff_lines else "(no changes)"
+
+
+class WriteFileTool(Tool):
+    name = "write_file"
+    description = "Write a UTF-8 text file inside the workspace and return a diff"
+    permission_action = "write"
+    argument_aliases = {"path": "file_path", "file": "file_path", "text": "content"}
+    input_schema = {
+        "type": "object",
+        "required": ["file_path", "content"],
+        "properties": {
+            "file_path": {"type": "string"},
+            "content": {"type": "string"},
+            "create_dirs": {"type": "boolean"},
+            "overwrite": {"type": "boolean"},
+        },
+    }
+
+    def is_read_only(self, input_data: Dict[str, Any]) -> bool:
+        return False
+
+    async def call(self, input_data: Dict[str, Any], context: ToolContext) -> ToolResult:
+        path = context.resolve_path(str(input_data["file_path"]))
+        context.check_permission("write", self.name, path, "write text file")
+
+        create_dirs = bool(input_data.get("create_dirs", False))
+        overwrite = bool(input_data.get("overwrite", False))
+        if path.exists() and not path.is_file():
+            raise ToolError("Path is not a file: %s" % path)
+        if path.exists() and not overwrite:
+            raise ToolError("File already exists and overwrite=false: %s" % path)
+        if not path.parent.exists():
+            if create_dirs:
+                path.parent.mkdir(parents=True, exist_ok=True)
+            else:
+                raise ToolError("Parent directory does not exist: %s" % path.parent)
+
+        old_text = path.read_text(encoding="utf-8", errors="replace") if path.exists() else ""
+        new_text = str(input_data["content"])
+        path.write_text(new_text, encoding="utf-8")
+        diff = make_unified_diff(old_text, new_text, path)
+        return ToolResult(
+            content="Wrote file: %s\nDiff:\n%s" % (path, diff),
+            raw={
+                "file_path": str(path),
+                "old_chars": len(old_text),
+                "new_chars": len(new_text),
+                "diff": diff,
+            },
+        )
+
+
+class EditFileTool(Tool):
+    name = "edit_file"
+    description = "Replace text in a workspace file and return a diff"
+    permission_action = "write"
+    argument_aliases = {"path": "file_path", "file": "file_path"}
+    input_schema = {
+        "type": "object",
+        "required": ["file_path", "old_text", "new_text"],
+        "properties": {
+            "file_path": {"type": "string"},
+            "old_text": {"type": "string"},
+            "new_text": {"type": "string"},
+            "replace_all": {"type": "boolean"},
+        },
+    }
+
+    def is_read_only(self, input_data: Dict[str, Any]) -> bool:
+        return False
+
+    async def call(self, input_data: Dict[str, Any], context: ToolContext) -> ToolResult:
+        path = context.resolve_path(str(input_data["file_path"]))
+        context.check_permission("write", self.name, path, "edit text file")
+        if not path.exists():
+            raise ToolError("File does not exist: %s" % path)
+        if not path.is_file():
+            raise ToolError("Path is not a file: %s" % path)
+
+        old_text = str(input_data["old_text"])
+        new_text = str(input_data["new_text"])
+        replace_all = bool(input_data.get("replace_all", False))
+        if old_text == "":
+            raise InputValidationError("old_text must not be empty")
+
+        original = path.read_text(encoding="utf-8", errors="replace")
+        count = original.count(old_text)
+        if count == 0:
+            raise ToolError("old_text was not found in file: %s" % path)
+        replacements = count if replace_all else 1
+        updated = original.replace(old_text, new_text, replacements)
+        path.write_text(updated, encoding="utf-8")
+        diff = make_unified_diff(original, updated, path)
+        return ToolResult(
+            content=(
+                "Edited file: %s\n"
+                "Replacements: %d\n"
+                "Diff:\n%s"
+                % (path, replacements, diff)
+            ),
+            raw={
+                "file_path": str(path),
+                "replacements": replacements,
+                "diff": diff,
+            },
+        )
+
+
 def default_tools() -> List[Tool]:
-    return [ReadFileTool(), ListDirTool(), GlobTool(), GrepTool()]
+    tools: List[Tool] = [
+        ReadFileTool(),
+        ListDirTool(),
+        GlobTool(),
+        GrepTool(),
+        WriteFileTool(),
+        EditFileTool(),
+    ]
+    from .powershell_tool import PowerShellTool
+
+    tools.append(PowerShellTool())
+    return tools
 
 
 def find_tool(tools: Sequence[Tool], name: str) -> Optional[Tool]:

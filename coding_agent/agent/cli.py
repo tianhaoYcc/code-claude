@@ -9,6 +9,7 @@ from .mock_model import HeuristicMockModelClient
 from .models import AssistantMessage, RequestStartEvent, TerminalResult, ToolEvent, UserMessage
 from .openai_model import OpenAICompatibleModelClient
 from .query_loop import QueryLoop, QueryLoopConfig
+from .tools import PermissionRequest
 from .transcript import Transcript
 
 
@@ -42,6 +43,55 @@ def build_parser() -> argparse.ArgumentParser:
         help="Load existing transcript messages before appending the new prompt.",
     )
     parser.add_argument("--max-turns", type=int, default=8)
+    parser.add_argument(
+        "--read-permission",
+        choices=["allow", "deny", "ask"],
+        default="allow",
+        help="Permission mode for read tools.",
+    )
+    parser.add_argument(
+        "--write-permission",
+        choices=["allow", "deny", "ask"],
+        default="deny",
+        help="Permission mode for write/edit tools.",
+    )
+    parser.add_argument(
+        "--shell-permission",
+        choices=["allow", "deny", "ask"],
+        default="deny",
+        help="Permission mode for the PowerShell tool.",
+    )
+    parser.add_argument(
+        "--max-tool-concurrency",
+        type=int,
+        default=10,
+        help="Maximum concurrent read-only tool calls.",
+    )
+    parser.add_argument(
+        "--shell-timeout-seconds",
+        type=int,
+        default=30,
+        help="Default timeout for a PowerShell command.",
+    )
+    parser.add_argument(
+        "--shell-max-output-chars",
+        type=int,
+        default=30000,
+        help="PowerShell output budget before the full result is written to disk.",
+    )
+    parser.add_argument(
+        "--disable-tool",
+        action="append",
+        default=[],
+        metavar="NAME",
+        help="Disable a registered tool before exposing tools to the model. Repeatable.",
+    )
+    parser.add_argument(
+        "--max-bad-tool-input-attempts",
+        type=int,
+        default=3,
+        help="Stop after this many malformed or schema-invalid tool inputs.",
+    )
     return parser
 
 
@@ -59,6 +109,20 @@ def build_model_client(args: argparse.Namespace):
         raise
 
 
+def ask_permission(request: PermissionRequest) -> bool:
+    print(
+        "[permission] tool=%s action=%s path=%s %s"
+        % (
+            request.tool_name,
+            request.action,
+            request.path or "",
+            request.description,
+        )
+    )
+    answer = input("Allow this tool call? [y/N] ").strip().lower()
+    return answer in ("y", "yes")
+
+
 async def run_cli(args: argparse.Namespace) -> int:
     workspace = Path(args.workspace).resolve()
     session_path = (
@@ -72,7 +136,18 @@ async def run_cli(args: argparse.Namespace) -> int:
         model_client=build_model_client(args),
         workspace_root=workspace,
         transcript=transcript,
-        config=QueryLoopConfig(max_turns=args.max_turns),
+        config=QueryLoopConfig(
+            max_turns=args.max_turns,
+            max_bad_tool_input_attempts=args.max_bad_tool_input_attempts,
+            max_tool_concurrency=args.max_tool_concurrency,
+            shell_timeout_seconds=args.shell_timeout_seconds,
+            shell_max_output_chars=args.shell_max_output_chars,
+            read_permission=args.read_permission,
+            write_permission=args.write_permission,
+            shell_permission=args.shell_permission,
+            permission_callback=ask_permission,
+            disabled_tools=tuple(args.disable_tool),
+        ),
         initial_messages=initial_messages,
     )
 
