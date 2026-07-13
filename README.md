@@ -7,25 +7,31 @@
 ## 章节
 
 - [第一章 初识 agent-query 循环](coding_agent/README.md)
-- 第二章 上下文压缩：待补充
-- 第三章 记忆系统：待补充
-- 第四章 工具注册与 ToolSearch：待补充
-- 第五章 权限、Shell 与 Plan Mode：待补充
+- [第二章 工具执行安全机制：让 Agent 有手，但不乱动手](docs/chapter-02-tool-safety.md)
+- 第三章 上下文压缩：待补充
+- 第四章 记忆系统：待补充
+- 第五章 规划与复杂任务执行：待补充
 
 ## 当前版本
 
-当前版本聚焦第一章：实现一个最小但完整的 agent query loop。
+当前版本覆盖第一章和第二章的基础实现：先让 agent query loop 跑起来，再让工具执行有参数校验、路径边界、权限策略和写入 diff。
 
 它已经支持：
 
 - OpenAI-compatible 大模型调用
 - mock 模型调试
 - `tool_use` / `tool_result` 循环
-- `read_file`、`list_dir`、`glob`、`grep` 四个工具
+- `read_file`、`list_dir`、`glob`、`grep`、`write_file`、`edit_file`、`powershell` 七个工具
+- malformed tool arguments 修复、schema 错误重试和坏参数次数上限
+- read/write/shell 三类 allow / deny / ask 权限策略
+- 写文件与编辑文件后的 unified diff 输出
+- 动态工具注册、启用/禁用和按权限过滤模型可见工具
+- 只读工具并发、写入与非只读 Shell 串行、取消和结果顺序保证
+- PowerShell 危险命令拦截、workspace cwd、超时和输出预算
 - workspace 路径保护
 - 大工具结果落盘与预览
 - append-only transcript
 - resume 时严格校验工具配对
 - 单元测试覆盖核心路径
 
-后续章节会继续补上下文压缩、记忆系统、动态工具注册、权限系统、写文件/编辑工具、Shell 工具和 Plan mode。
+后续章节会继续补上下文压缩、记忆系统、Plan mode、子 agent、MCP 和 ToolSearch。
