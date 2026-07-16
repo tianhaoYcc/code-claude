@@ -9,11 +9,13 @@ import urllib.request
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence
 
-from .model_client import ModelClient
+from .model_client import ModelClient, ModelRequestError
 from .models import (
     AssistantMessage,
     AttachmentMessage,
     Message,
+    SystemMessage,
+    TokenUsage,
     ToolUseBlock,
     UserMessage,
     new_uuid,
@@ -88,12 +90,13 @@ class OpenAICompatibleModelClient(ModelClient):
         tools: Sequence[Tool],
         system_prompt: str,
     ):
-        payload = {
+        payload: Dict[str, Any] = {
             "model": self.model_id,
             "messages": to_openai_messages(messages, system_prompt),
-            "tools": [tool_to_openai_schema(tool) for tool in tools],
-            "tool_choice": "auto",
         }
+        if tools:
+            payload["tools"] = [tool_to_openai_schema(tool) for tool in tools]
+            payload["tool_choice"] = "auto"
         data = self._post_chat_completion(payload)
         yield assistant_from_openai_response(data)
 
@@ -117,16 +120,36 @@ class OpenAICompatibleModelClient(ModelClient):
                 response_body = response.read().decode("utf-8")
         except urllib.error.HTTPError as exc:
             error_body = exc.read().decode("utf-8", errors="replace")
-            raise RuntimeError(
-                "LLM request failed with HTTP %s: %s" % (exc.code, error_body)
+            raise ModelRequestError(
+                "LLM request failed with HTTP %s: %s" % (exc.code, error_body),
+                status_code=int(exc.code),
+                response_body=error_body,
+                prompt_too_long=is_prompt_too_long_error(int(exc.code), error_body),
             )
         except urllib.error.URLError as exc:
-            raise RuntimeError("LLM request failed: %s" % exc)
+            raise ModelRequestError("LLM request failed: %s" % exc)
 
         try:
             return json.loads(response_body)
         except json.JSONDecodeError as exc:
-            raise RuntimeError("LLM response was not valid JSON: %s" % exc)
+            raise ModelRequestError("LLM response was not valid JSON: %s" % exc)
+
+
+def is_prompt_too_long_error(status_code: int, response_body: str) -> bool:
+    if status_code not in (400, 413, 422):
+        return False
+    lowered = response_body.lower()
+    markers = (
+        "context_length_exceeded",
+        "maximum context length",
+        "context window",
+        "prompt is too long",
+        "prompt too long",
+        "input is too long",
+        "input too long",
+        "too many tokens",
+    )
+    return any(marker in lowered for marker in markers)
 
 
 def create_ssl_context() -> ssl.SSLContext:
@@ -211,6 +234,8 @@ def to_openai_messages(messages: Sequence[Message], system_prompt: str) -> List[
             result.extend(user_to_openai_messages(message))
         elif isinstance(message, AttachmentMessage):
             result.append({"role": "user", "content": repr(message.attachment)})
+        elif isinstance(message, SystemMessage):
+            continue
     return result
 
 
@@ -297,10 +322,31 @@ def assistant_from_openai_response(data: Dict[str, Any]) -> AssistantMessage:
     if not content_blocks:
         content_blocks.append(text_block(""))
 
+    usage_data = data.get("usage") or {}
+    input_tokens = int(
+        usage_data.get("prompt_tokens")
+        or usage_data.get("input_tokens")
+        or 0
+    )
+    output_tokens = int(
+        usage_data.get("completion_tokens")
+        or usage_data.get("output_tokens")
+        or 0
+    )
+    total_tokens = int(
+        usage_data.get("total_tokens")
+        or input_tokens + output_tokens
+    )
+
     return AssistantMessage(
         content=content_blocks,
         model=str(data.get("model") or "openai-compatible"),
         stop_reason="tool_use" if message.get("tool_calls") else finish_reason,
+        usage=TokenUsage(
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+            total_tokens=total_tokens,
+        ) if usage_data else None,
     )
 
 

@@ -8,13 +8,13 @@
 
 - [第一章 初识 agent-query 循环](coding_agent/README.md)
 - [第二章 工具执行安全机制：让 Agent 有手，但不乱动手](docs/chapter-02-tool-safety.md)
-- 第三章 上下文压缩：待补充
+- [第三章 上下文压缩：让 Agent 在长对话中继续工作](docs/chapter-03-context-compaction.md)
 - 第四章 记忆系统：待补充
 - 第五章 规划与复杂任务执行：待补充
 
 ## 当前版本
 
-当前版本覆盖第一章和第二章的基础实现：先让 agent query loop 跑起来，再让工具执行有参数校验、路径边界、权限策略和写入 diff。
+当前版本覆盖前三章的基础实现：先让 agent query loop 跑起来，再补齐工具执行安全和长对话上下文压缩。
 
 它已经支持：
 
@@ -32,6 +32,10 @@
 - 大工具结果落盘与预览
 - append-only transcript
 - resume 时严格校验工具配对
+- OpenAI-compatible token usage 记录与本地保守 token 估算
+- 完整 transcript 与模型活跃上下文分离
+- microcompact 旧工具结果、完整摘要和 compact boundary
+- 自动压缩、手动压缩、prompt-too-long 恢复和三次失败熔断
 - 单元测试覆盖核心路径
 
-后续章节会继续补上下文压缩、记忆系统、Plan mode、子 agent、MCP 和 ToolSearch。
+后续章节会继续补记忆系统、Plan mode、子 agent、MCP 和 ToolSearch。

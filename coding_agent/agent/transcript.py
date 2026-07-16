@@ -25,7 +25,7 @@ class Transcript:
             return
         if hasattr(event, "to_record"):
             record = event.to_record()
-            if record.get("type") in {"user", "assistant", "attachment"}:
+            if record.get("type") in {"user", "assistant", "attachment", "system"}:
                 self._append({"record_type": "message", "message": record})
             else:
                 self._append({"record_type": "event", "event": record})

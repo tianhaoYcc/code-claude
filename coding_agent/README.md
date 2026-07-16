@@ -60,6 +60,15 @@ cd /d "E:\code claude\coding_agent"
 
 `powershell` 工具有危险命令拦截、workspace cwd、超时、取消和大输出落盘，但它不是操作系统级沙箱。复杂或无法静态证明安全的命令仍应经过人工确认。
 
+自动上下文压缩默认开启，按 128K context window 估算。模型窗口不同时可以显式配置；已有 session 也可以手动压缩：
+
+```powershell
+cd /d "E:\code claude\coding_agent"
+& "E:\Anconda\python.exe" -m agent.cli --workspace . --session ".agent_sessions\demo.jsonl" --resume --compact --model-client openai --context-window-tokens 32768
+```
+
+完整机制见 [第三章 上下文压缩](../docs/chapter-03-context-compaction.md)。
+
 也可以直接运行入口文件，不依赖 `-m agent.cli` 的包路径：
 
 ```powershell
@@ -81,6 +90,7 @@ cd /d "E:\code claude\coding_agent"
 - `agent/model_client.py`：抽象模型客户端接口。
 - `agent/mock_model.py`：脚本化和启发式 mock 模型客户端。
 - `agent/openai_model.py`：OpenAI-compatible Chat Completions 适配器。
+- `agent/context_manager.py`：token 预算、上下文投影、microcompact、摘要压缩和恢复边界。
 - `agent/tools.py`：文件工具、路径保护、输入校验、权限策略、diff 输出和工具结果预算。
 - `agent/tool_registry.py`：动态工具注册、启用/禁用和模型可见工具过滤。
 - `agent/tool_orchestration.py`：只读并发、变更串行、工具事件和结果顺序保证。
@@ -217,6 +227,8 @@ Claude Code 用 append-only JSONL transcript 保存会话，并在 resume 时重
 
 这对应 Claude Code 在 `src/utils/messages.ts` 中对 `tool_use` / `tool_result` 配对进行修复或严格检查的思路。
 
+长对话中的 transcript 投影、microcompact 和完整摘要已经独立成 [第三章 上下文压缩](../docs/chapter-03-context-compaction.md)。第一章的 query loop 在每次模型请求前通过 `ContextManager` 获取活跃消息，但完整 transcript 仍保持 append-only。
+
 ## 当前版本支持的工具
 
 默认工具由 `default_tools()` 创建，再进入 `ToolRegistry`；运行时也可以通过 `register_tool()` 增加或替换工具：
@@ -235,7 +247,6 @@ Claude Code 用 append-only JSONL transcript 保存会话，并在 resume 时重
 
 还没有实现：
 
-- 上下文压缩
 - 记忆系统
 - ToolSearch
 - MCP 工具发现与动态加载

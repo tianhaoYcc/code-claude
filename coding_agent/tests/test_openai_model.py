@@ -8,6 +8,7 @@ from agent.models import AssistantMessage, UserMessage, tool_result_block
 from agent.openai_model import (
     OpenAICompatibleModelClient,
     assistant_from_openai_response,
+    is_prompt_too_long_error,
     normalize_chat_completions_url,
     parse_tool_arguments,
     to_openai_messages,
@@ -107,6 +108,38 @@ class OpenAIModelTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(tool_use.name, "read_file")
         self.assertEqual(tool_use.input, {"file_path": "README.md"})
 
+    def test_openai_usage_maps_to_internal_token_usage(self):
+        assistant = assistant_from_openai_response(
+            {
+                "model": "fake-model",
+                "usage": {
+                    "prompt_tokens": 120,
+                    "completion_tokens": 30,
+                    "total_tokens": 150,
+                },
+                "choices": [
+                    {
+                        "finish_reason": "stop",
+                        "message": {"content": "done"},
+                    }
+                ],
+            }
+        )
+
+        self.assertIsNotNone(assistant.usage)
+        self.assertEqual(assistant.usage.input_tokens, 120)
+        self.assertEqual(assistant.usage.output_tokens, 30)
+        self.assertEqual(assistant.usage.total_tokens, 150)
+
+    def test_prompt_too_long_error_is_classified_for_recovery(self):
+        self.assertTrue(
+            is_prompt_too_long_error(
+                400,
+                '{"error":{"code":"context_length_exceeded"}}',
+            )
+        )
+        self.assertFalse(is_prompt_too_long_error(401, "context_length_exceeded"))
+
     def test_malformed_tool_arguments_are_repaired_when_possible(self):
         self.assertEqual(parse_tool_arguments('{}{"path": "."}'), {"path": "."})
         self.assertEqual(
@@ -145,6 +178,22 @@ class OpenAIModelTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(client.payload["model"], "model")
         self.assertEqual(client.payload["tools"][0]["function"]["name"], "read_file")
         self.assertEqual(assistant.tool_uses()[0].name, "read_file")
+
+    async def test_client_omits_tool_fields_for_compaction_request(self):
+        response = {
+            "choices": [
+                {
+                    "message": {"content": "summary"},
+                    "finish_reason": "stop",
+                }
+            ]
+        }
+        client = FakeOpenAIClient(response)
+
+        await collect_one(client, [UserMessage("summarize")], [])
+
+        self.assertNotIn("tools", client.payload)
+        self.assertNotIn("tool_choice", client.payload)
 
 
 if __name__ == "__main__":

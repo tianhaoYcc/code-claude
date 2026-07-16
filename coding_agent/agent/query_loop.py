@@ -1,13 +1,19 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import AsyncIterator, List, Optional, Sequence, Tuple, Union
 
-from .model_client import ModelClient
+from .context_manager import (
+    COMPACTION_SYSTEM_PROMPT,
+    ContextConfig,
+    ContextManager,
+)
+from .model_client import ModelClient, ModelRequestError
 from .models import (
     AgentEvent,
     AssistantMessage,
+    CompactionEvent,
     Message,
     RequestStartEvent,
     TerminalResult,
@@ -39,6 +45,7 @@ class QueryLoopConfig:
     shell_permission: str = "deny"
     permission_callback: Optional[PermissionCallback] = None
     disabled_tools: Tuple[str, ...] = ()
+    context: ContextConfig = field(default_factory=ContextConfig)
     system_prompt: str = (
         "You are a coding agent. Use tools when they are useful. "
         "Every tool_use must be answered with a matching tool_result. "
@@ -60,15 +67,18 @@ class QueryLoop:
         transcript: Optional[Transcript] = None,
         config: Optional[QueryLoopConfig] = None,
         initial_messages: Optional[Sequence[Message]] = None,
+        summary_model_client: Optional[ModelClient] = None,
     ):
         if tools is not None and registry is not None:
             raise ValueError("Pass either tools or registry, not both")
         self.model_client = model_client
+        self.summary_model_client = summary_model_client or model_client
         self.workspace_root = Path(workspace_root).resolve()
         self.transcript = transcript
         self.config = config or QueryLoopConfig()
         self.messages: List[Message] = list(initial_messages or [])
         self.bad_tool_input_attempts = 0
+        self.context_manager = ContextManager(self.config.context)
         self.registry = registry or (
             ToolRegistry(tools) if tools is not None else default_registry()
         )
@@ -108,6 +118,16 @@ class QueryLoop:
     def cancel(self) -> None:
         self.tool_context.cancel_event.set()
 
+    def active_messages(self) -> List[Message]:
+        return self.context_manager.project(self.messages)
+
+    async def compact(
+        self,
+        trigger: str = "manual",
+    ) -> AsyncIterator[CompactionEvent]:
+        async for event in self._compact(trigger=trigger, force_full=True):
+            yield event
+
     async def run(self, prompt: Optional[str] = None) -> AsyncIterator[AgentEvent]:
         if prompt is not None:
             user_message = UserMessage(content=prompt)
@@ -128,20 +148,55 @@ class QueryLoop:
                 yield terminal
                 return
 
+            async for compaction_event in self._maybe_auto_compact():
+                yield compaction_event
+
             request_event = RequestStartEvent(turn_count=turn_count)
             self._record(request_event)
             yield request_event
 
             assistant_messages: List[AssistantMessage] = []
-            async for assistant_message in self.model_client.stream(
-                tuple(self.messages),
-                tuple(self.available_tools()),
-                self.config.system_prompt,
-            ):
-                assistant_messages.append(assistant_message)
-                self.messages.append(assistant_message)
-                self._record(assistant_message)
-                yield assistant_message
+            prompt_too_long_retried = False
+            while True:
+                pending_messages: List[AssistantMessage] = []
+                try:
+                    async for assistant_message in self.model_client.stream(
+                        tuple(self.active_messages()),
+                        tuple(self.available_tools()),
+                        self.config.system_prompt,
+                    ):
+                        pending_messages.append(assistant_message)
+                except ModelRequestError as exc:
+                    if exc.prompt_too_long and not prompt_too_long_retried:
+                        compacted = False
+                        async for compaction_event in self._compact(
+                            trigger="prompt_too_long",
+                            force_full=True,
+                        ):
+                            if compaction_event.status == "completed":
+                                compacted = True
+                            yield compaction_event
+                        if compacted:
+                            prompt_too_long_retried = True
+                            continue
+
+                    reason = "prompt_too_long" if exc.prompt_too_long else "model_error"
+                    terminal = TerminalResult(
+                        reason=reason,
+                        turn_count=turn_count,
+                        is_error=True,
+                        message=str(exc),
+                    )
+                    self._record(terminal)
+                    yield terminal
+                    return
+
+                assistant_messages = pending_messages
+                for assistant_message in assistant_messages:
+                    self.messages.append(assistant_message)
+                    self._record(assistant_message)
+                    yield assistant_message
+                break
 
             if self.tool_context.cancel_event.is_set():
                 terminal = TerminalResult(
@@ -224,6 +279,168 @@ class QueryLoop:
                 return
 
             turn_count = next_turn_count
+
+    async def _maybe_auto_compact(self) -> AsyncIterator[CompactionEvent]:
+        token_count = self.context_manager.current_token_count(
+            self.messages,
+            self.available_tools(),
+            self.config.system_prompt,
+        )
+        if not self.context_manager.should_auto_compact(token_count):
+            return
+        async for event in self._compact(trigger="auto", force_full=False):
+            yield event
+
+    async def _compact(
+        self,
+        trigger: str,
+        force_full: bool,
+    ) -> AsyncIterator[CompactionEvent]:
+        available_tools = self.available_tools()
+        before_tokens = self.context_manager.current_token_count(
+            self.messages,
+            available_tools,
+            self.config.system_prompt,
+        )
+        started = CompactionEvent(
+            status="started",
+            trigger=trigger,
+            before_tokens=before_tokens,
+            after_tokens=before_tokens,
+        )
+        self._record(started)
+        yield started
+
+        micro_boundary = self.context_manager.build_microcompact_boundary(
+            self.messages,
+            available_tools,
+            self.config.system_prompt,
+        )
+        if micro_boundary is not None:
+            self.messages.append(micro_boundary)
+            self._record(micro_boundary)
+            after_micro_tokens = self.context_manager.current_token_count(
+                self.messages,
+                available_tools,
+                self.config.system_prompt,
+            )
+            micro_event = CompactionEvent(
+                status="microcompacted",
+                trigger=trigger,
+                before_tokens=before_tokens,
+                after_tokens=after_micro_tokens,
+                message="Compacted %d old tool result(s)"
+                % len(micro_boundary.metadata.get("tool_use_ids") or []),
+            )
+            self._record(micro_event)
+            yield micro_event
+
+            if (
+                not force_full
+                and after_micro_tokens
+                < self.context_manager.config.auto_compact_threshold
+            ):
+                self.context_manager.note_compaction_success()
+                completed = CompactionEvent(
+                    status="completed",
+                    trigger=trigger,
+                    before_tokens=before_tokens,
+                    after_tokens=after_micro_tokens,
+                    message="Microcompact reduced context below the threshold",
+                )
+                self._record(completed)
+                yield completed
+                return
+
+        try:
+            plan = self.context_manager.build_full_compaction_plan(
+                self.messages,
+                available_tools,
+                self.config.system_prompt,
+            )
+            summary_attempts = 0
+            while True:
+                summary_messages: List[AssistantMessage] = []
+                try:
+                    async for summary_message in self.summary_model_client.stream(
+                        tuple(self.context_manager.summary_request_messages(plan)),
+                        (),
+                        COMPACTION_SYSTEM_PROMPT,
+                    ):
+                        summary_messages.append(summary_message)
+                except ModelRequestError as exc:
+                    if exc.prompt_too_long and summary_attempts < 3:
+                        truncated_plan = (
+                            self.context_manager.truncate_plan_for_prompt_too_long(
+                                plan
+                            )
+                        )
+                        if truncated_plan is not None:
+                            plan = truncated_plan
+                            summary_attempts += 1
+                            continue
+                    raise
+                break
+
+            if not summary_messages:
+                raise RuntimeError("Compaction model returned no message")
+            if any(message.tool_uses() for message in summary_messages):
+                raise RuntimeError("Compaction model attempted to call a tool")
+            summary_text = "\n".join(
+                message.text_content() for message in summary_messages
+                if message.text_content()
+            )
+            summary_usage = next(
+                (
+                    message.usage
+                    for message in reversed(summary_messages)
+                    if message.usage is not None
+                ),
+                None,
+            )
+            boundary, summary = self.context_manager.commit_full_compaction(
+                self.messages,
+                plan,
+                summary_text,
+                available_tools,
+                self.config.system_prompt,
+                summary_usage,
+            )
+            self.messages.extend([boundary, summary])
+            self._record(boundary)
+            self._record(summary)
+            after_tokens = self.context_manager.current_token_count(
+                self.messages,
+                available_tools,
+                self.config.system_prompt,
+            )
+        except Exception as exc:
+            self.context_manager.note_compaction_failure()
+            failed = CompactionEvent(
+                status="failed",
+                trigger=trigger,
+                before_tokens=before_tokens,
+                after_tokens=self.context_manager.current_token_count(
+                    self.messages,
+                    available_tools,
+                    self.config.system_prompt,
+                ),
+                message=str(exc),
+            )
+            self._record(failed)
+            yield failed
+            return
+
+        self.context_manager.note_compaction_success()
+        completed = CompactionEvent(
+            status="completed",
+            trigger=trigger,
+            before_tokens=before_tokens,
+            after_tokens=after_tokens,
+            message="Conversation summary and compact boundary were appended",
+        )
+        self._record(completed)
+        yield completed
 
     async def _run_tool_batch(
         self,

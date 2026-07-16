@@ -5,8 +5,16 @@ import asyncio
 from pathlib import Path
 from uuid import uuid4
 
+from .context_manager import ContextConfig
 from .mock_model import HeuristicMockModelClient
-from .models import AssistantMessage, RequestStartEvent, TerminalResult, ToolEvent, UserMessage
+from .models import (
+    AssistantMessage,
+    CompactionEvent,
+    RequestStartEvent,
+    TerminalResult,
+    ToolEvent,
+    UserMessage,
+)
 from .openai_model import OpenAICompatibleModelClient
 from .query_loop import QueryLoop, QueryLoopConfig
 from .tools import PermissionRequest
@@ -92,6 +100,48 @@ def build_parser() -> argparse.ArgumentParser:
         default=3,
         help="Stop after this many malformed or schema-invalid tool inputs.",
     )
+    parser.add_argument(
+        "--compact",
+        action="store_true",
+        help="Run a manual full compaction before sending the prompt.",
+    )
+    parser.add_argument(
+        "--no-auto-compact",
+        action="store_false",
+        dest="auto_compact",
+        help="Disable threshold-based automatic context compaction.",
+    )
+    parser.set_defaults(auto_compact=True)
+    parser.add_argument(
+        "--context-window-tokens",
+        type=int,
+        default=128000,
+        help="Model context window used by the local compaction policy.",
+    )
+    parser.add_argument(
+        "--reserved-output-tokens",
+        type=int,
+        default=8192,
+        help="Tokens reserved for the next model response.",
+    )
+    parser.add_argument(
+        "--auto-compact-ratio",
+        type=float,
+        default=0.8,
+        help="Compact when estimated usage reaches this effective-context ratio.",
+    )
+    parser.add_argument(
+        "--preserve-recent-groups",
+        type=int,
+        default=4,
+        help="Atomic recent message groups preserved verbatim after full compaction.",
+    )
+    parser.add_argument(
+        "--microcompact-keep-tool-results",
+        type=int,
+        default=4,
+        help="Number of recent tool results excluded from microcompact.",
+    )
     return parser
 
 
@@ -147,32 +197,64 @@ async def run_cli(args: argparse.Namespace) -> int:
             shell_permission=args.shell_permission,
             permission_callback=ask_permission,
             disabled_tools=tuple(args.disable_tool),
+            context=ContextConfig(
+                auto_compact_enabled=args.auto_compact,
+                context_window_tokens=args.context_window_tokens,
+                reserved_output_tokens=args.reserved_output_tokens,
+                auto_compact_ratio=args.auto_compact_ratio,
+                preserve_recent_groups=args.preserve_recent_groups,
+                microcompact_keep_recent_tool_results=(
+                    args.microcompact_keep_tool_results
+                ),
+            ),
         ),
         initial_messages=initial_messages,
     )
 
+    if args.compact:
+        async for event in loop.compact(trigger="manual"):
+            print_event(event)
+        if not args.prompt:
+            print("transcript:", session_path)
+            return 0
+
     async for event in loop.run(args.prompt):
-        if isinstance(event, UserMessage):
-            if not event.is_meta:
-                print("user:", event.content)
-        elif isinstance(event, RequestStartEvent):
-            print("[request_start] turn=%d" % event.turn_count)
-        elif isinstance(event, AssistantMessage):
-            text = event.text_content()
-            if text:
-                print("assistant:", text)
-            for tool_use in event.tool_uses():
-                print("assistant tool_use: %s %s" % (tool_use.name, tool_use.input))
-        elif isinstance(event, ToolEvent):
-            print(
-                "[tool] %s %s %s"
-                % (event.status, event.tool_name, event.message or "")
-            )
-        elif isinstance(event, TerminalResult):
-            print("[terminal] reason=%s turns=%d" % (event.reason, event.turn_count))
+        print_event(event)
 
     print("transcript:", session_path)
     return 0
+
+
+def print_event(event) -> None:
+    if isinstance(event, UserMessage):
+        if not event.is_meta:
+            print("user:", event.content)
+    elif isinstance(event, RequestStartEvent):
+        print("[request_start] turn=%d" % event.turn_count)
+    elif isinstance(event, AssistantMessage):
+        text = event.text_content()
+        if text:
+            print("assistant:", text)
+        for tool_use in event.tool_uses():
+            print("assistant tool_use: %s %s" % (tool_use.name, tool_use.input))
+    elif isinstance(event, ToolEvent):
+        print(
+            "[tool] %s %s %s"
+            % (event.status, event.tool_name, event.message or "")
+        )
+    elif isinstance(event, CompactionEvent):
+        print(
+            "[compact] %s trigger=%s tokens=%d->%d %s"
+            % (
+                event.status,
+                event.trigger,
+                event.before_tokens,
+                event.after_tokens,
+                event.message or "",
+            )
+        )
+    elif isinstance(event, TerminalResult):
+        print("[terminal] reason=%s turns=%d" % (event.reason, event.turn_count))
 
 
 def main() -> None:

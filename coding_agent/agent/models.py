@@ -19,6 +19,39 @@ def new_uuid() -> str:
 
 
 @dataclass
+class TokenUsage:
+    input_tokens: int = 0
+    output_tokens: int = 0
+    total_tokens: int = 0
+    estimated: bool = False
+
+    def __post_init__(self) -> None:
+        self.input_tokens = max(0, int(self.input_tokens))
+        self.output_tokens = max(0, int(self.output_tokens))
+        self.total_tokens = max(
+            0,
+            int(self.total_tokens or self.input_tokens + self.output_tokens),
+        )
+
+    def to_record(self) -> Dict[str, Any]:
+        return {
+            "input_tokens": self.input_tokens,
+            "output_tokens": self.output_tokens,
+            "total_tokens": self.total_tokens,
+            "estimated": self.estimated,
+        }
+
+    @classmethod
+    def from_record(cls, record: Dict[str, Any]) -> "TokenUsage":
+        return cls(
+            input_tokens=int(record.get("input_tokens") or 0),
+            output_tokens=int(record.get("output_tokens") or 0),
+            total_tokens=int(record.get("total_tokens") or 0),
+            estimated=bool(record.get("estimated", False)),
+        )
+
+
+@dataclass
 class ToolUseBlock:
     id: str
     name: str
@@ -70,6 +103,7 @@ def tool_result_block(
 class UserMessage:
     content: MessageContent
     is_meta: bool = False
+    is_compact_summary: bool = False
     tool_use_result: Any = None
     uuid: str = field(default_factory=new_uuid)
     timestamp: str = field(default_factory=utc_now_iso)
@@ -94,6 +128,7 @@ class UserMessage:
             "uuid": self.uuid,
             "timestamp": self.timestamp,
             "is_meta": self.is_meta,
+            "is_compact_summary": self.is_compact_summary,
             "content": self.content,
             "tool_use_result": self.tool_use_result,
             "source_tool_assistant_uuid": self.source_tool_assistant_uuid,
@@ -104,6 +139,7 @@ class UserMessage:
         return cls(
             content=record.get("content", ""),
             is_meta=bool(record.get("is_meta", False)),
+            is_compact_summary=bool(record.get("is_compact_summary", False)),
             tool_use_result=record.get("tool_use_result"),
             uuid=str(record.get("uuid") or new_uuid()),
             timestamp=str(record.get("timestamp") or utc_now_iso()),
@@ -118,6 +154,7 @@ class AssistantMessage:
     timestamp: str = field(default_factory=utc_now_iso)
     model: str = "mock"
     stop_reason: Optional[str] = None
+    usage: Optional[TokenUsage] = None
     type: str = field(init=False, default="assistant")
 
     @classmethod
@@ -180,6 +217,7 @@ class AssistantMessage:
             "timestamp": self.timestamp,
             "model": self.model,
             "stop_reason": self.stop_reason,
+            "usage": self.usage.to_record() if self.usage is not None else None,
             "content": self.content,
         }
 
@@ -191,6 +229,11 @@ class AssistantMessage:
             timestamp=str(record.get("timestamp") or utc_now_iso()),
             model=str(record.get("model") or "mock"),
             stop_reason=record.get("stop_reason"),
+            usage=(
+                TokenUsage.from_record(record["usage"])
+                if isinstance(record.get("usage"), dict)
+                else None
+            ),
         )
 
 
@@ -218,7 +261,45 @@ class AttachmentMessage:
         )
 
 
-Message = Union[UserMessage, AssistantMessage, AttachmentMessage]
+@dataclass
+class SystemMessage:
+    """Local runtime marker persisted in the transcript but not sent directly."""
+
+    subtype: str
+    content: str = ""
+    metadata: Dict[str, Any] = field(default_factory=dict)
+    is_meta: bool = True
+    uuid: str = field(default_factory=new_uuid)
+    timestamp: str = field(default_factory=utc_now_iso)
+    type: str = field(init=False, default="system")
+
+    def to_api_message(self) -> Dict[str, Any]:
+        return {"role": "system", "content": self.content}
+
+    def to_record(self) -> Dict[str, Any]:
+        return {
+            "type": self.type,
+            "subtype": self.subtype,
+            "content": self.content,
+            "metadata": self.metadata,
+            "is_meta": self.is_meta,
+            "uuid": self.uuid,
+            "timestamp": self.timestamp,
+        }
+
+    @classmethod
+    def from_record(cls, record: Dict[str, Any]) -> "SystemMessage":
+        return cls(
+            subtype=str(record.get("subtype") or "runtime_marker"),
+            content=str(record.get("content") or ""),
+            metadata=dict(record.get("metadata") or {}),
+            is_meta=bool(record.get("is_meta", True)),
+            uuid=str(record.get("uuid") or new_uuid()),
+            timestamp=str(record.get("timestamp") or utc_now_iso()),
+        )
+
+
+Message = Union[UserMessage, AssistantMessage, AttachmentMessage, SystemMessage]
 
 
 @dataclass
@@ -249,6 +330,26 @@ class ToolEvent:
 
 
 @dataclass
+class CompactionEvent:
+    status: str
+    trigger: str
+    before_tokens: int = 0
+    after_tokens: int = 0
+    message: str = ""
+    type: str = field(init=False, default="compaction")
+
+    def to_record(self) -> Dict[str, Any]:
+        return {
+            "type": self.type,
+            "status": self.status,
+            "trigger": self.trigger,
+            "before_tokens": self.before_tokens,
+            "after_tokens": self.after_tokens,
+            "message": self.message,
+        }
+
+
+@dataclass
 class TerminalResult:
     reason: str
     turn_count: int
@@ -266,7 +367,13 @@ class TerminalResult:
         }
 
 
-AgentEvent = Union[RequestStartEvent, ToolEvent, TerminalResult, Message]
+AgentEvent = Union[
+    RequestStartEvent,
+    ToolEvent,
+    CompactionEvent,
+    TerminalResult,
+    Message,
+]
 
 
 def message_from_record(record: Dict[str, Any]) -> Message:
@@ -277,6 +384,8 @@ def message_from_record(record: Dict[str, Any]) -> Message:
         return AssistantMessage.from_record(record)
     if record_type == "attachment":
         return AttachmentMessage.from_record(record)
+    if record_type == "system":
+        return SystemMessage.from_record(record)
     raise ValueError("Unsupported message record type: %r" % (record_type,))
 
 
@@ -290,6 +399,8 @@ def messages_to_api(messages: Iterable[Message]) -> List[Dict[str, Any]]:
                     "content": "[attachment] " + repr(message.attachment),
                 }
             )
+        elif isinstance(message, SystemMessage):
+            continue
         else:
             api_messages.append(message.to_api_message())
     return api_messages
