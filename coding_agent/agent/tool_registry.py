@@ -42,8 +42,8 @@ class ToolRegistry:
     def all_tools(self) -> Tuple[Tool, ...]:
         return tuple(self._tools.values())
 
-    def available_tools(self, permission_policy: PermissionPolicy) -> Tuple[Tool, ...]:
-        available: List[Tool] = []
+    def enabled_tools(self) -> Tuple[Tool, ...]:
+        enabled: List[Tool] = []
         for name, tool in self._tools.items():
             if name in self._disabled:
                 continue
@@ -52,6 +52,12 @@ class ToolRegistry:
                     continue
             except Exception:
                 continue
+            enabled.append(tool)
+        return tuple(enabled)
+
+    def available_tools(self, permission_policy: PermissionPolicy) -> Tuple[Tool, ...]:
+        available: List[Tool] = []
+        for tool in self.enabled_tools():
             action = tool.permission_action
             if action and permission_policy.mode_for(action) == "deny":
                 continue

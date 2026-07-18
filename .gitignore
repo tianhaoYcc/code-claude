@@ -15,3 +15,5 @@ coding_agent/IMPROVEMENT_CHECKLIST.md
 **/.agent_outputs/
 **/.agent_sessions/
 **/.agent_tmp/
+**/.agent_memory/
+**/.agent_plans/

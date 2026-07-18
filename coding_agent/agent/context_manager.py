@@ -159,11 +159,7 @@ class ContextManager:
             payload.append(
                 {
                     "tools": [
-                        {
-                            "name": tool.name,
-                            "description": tool.description,
-                            "input_schema": tool.input_schema,
-                        }
+                        tool.schema_for_model()
                         for tool in tools
                     ]
                 }
@@ -346,6 +342,107 @@ class ContextManager:
         )
         return boundary, summary
 
+    def commit_session_memory_compaction(
+        self,
+        messages: Sequence[Message],
+        summary_text: str,
+        checkpoint_message_uuid: str,
+        transcript_path: Optional[str] = None,
+        tools: Sequence[Tool] = (),
+        system_prompt: str = "",
+        min_preserved_tokens: int = 10000,
+        min_text_groups: int = 5,
+        max_preserved_tokens: int = 40000,
+    ) -> Optional[Tuple[SystemMessage, UserMessage]]:
+        normalized_summary = summary_text.strip()
+        if not normalized_summary:
+            return None
+        active = self.project(messages)
+        groups = group_atomic_messages(active)
+        checkpoint_group_index = next(
+            (
+                index
+                for index, group in enumerate(groups)
+                if any(
+                    message.uuid == checkpoint_message_uuid for message in group
+                )
+            ),
+            -1,
+        )
+        if checkpoint_group_index < 0:
+            return None
+
+        keep_start = checkpoint_group_index + 1
+        preserved_groups = list(groups[keep_start:])
+        preserved_tokens = self.estimate_tokens(
+            [message for group in preserved_groups for message in group]
+        )
+        text_groups = sum(1 for group in preserved_groups if _group_has_text(group))
+        while keep_start > 0 and (
+            preserved_tokens < min_preserved_tokens
+            or text_groups < min_text_groups
+        ):
+            candidate_group = groups[keep_start - 1]
+            candidate_tokens = self.estimate_tokens(candidate_group)
+            if preserved_tokens + candidate_tokens > max_preserved_tokens:
+                break
+            keep_start -= 1
+            preserved_groups.insert(0, candidate_group)
+            preserved_tokens += candidate_tokens
+            if _group_has_text(candidate_group):
+                text_groups += 1
+
+        preserved = [
+            message for group in preserved_groups for message in group
+        ]
+        summarized = [
+            message for group in groups[:keep_start] for message in group
+        ]
+        transcript_note = (
+            "\n\nFull transcript: %s" % transcript_path
+            if transcript_path
+            else ""
+        )
+        summary = UserMessage(
+            content=(
+                "This session continues from an earlier conversation. The "
+                "structured checkpoint below covers the earlier work.\n\n"
+                "<context_summary source=\"session_memory\">\n%s\n"
+                "</context_summary>%s\n\n"
+                "Recent messages are preserved verbatim. Continue the current "
+                "task directly without asking the user to repeat it."
+                % (normalized_summary, transcript_note)
+            ),
+            is_meta=True,
+            is_compact_summary=True,
+        )
+        boundary = SystemMessage(
+            subtype="compact_boundary",
+            content="Conversation before this boundary used session memory.",
+            metadata={
+                "source": "session_memory",
+                "summary_uuid": summary.uuid,
+                "checkpoint_message_uuid": checkpoint_message_uuid,
+                "summarized_message_uuids": [
+                    message.uuid for message in summarized
+                ],
+                "preserved_message_uuids": [
+                    message.uuid for message in preserved
+                ],
+                "dropped_message_uuids": [],
+                "before_tokens": self.estimate_tokens(
+                    active, tools, system_prompt
+                ),
+            },
+        )
+        candidate = list(messages) + [boundary, summary]
+        boundary.metadata["after_tokens"] = self.estimate_tokens(
+            self.project(candidate),
+            tools,
+            system_prompt,
+        )
+        return boundary, summary
+
     def note_compaction_success(self) -> None:
         self.consecutive_failures = 0
 
@@ -507,3 +604,13 @@ def group_atomic_messages(messages: Sequence[Message]) -> List[List[Message]]:
         groups.append([message])
         index += 1
     return groups
+
+
+def _group_has_text(messages: Sequence[Message]) -> bool:
+    for message in messages:
+        if isinstance(message, UserMessage):
+            if isinstance(message.content, str) and message.content.strip():
+                return True
+        elif isinstance(message, AssistantMessage) and message.text_content().strip():
+            return True
+    return False

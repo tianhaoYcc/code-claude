@@ -60,11 +60,17 @@ class ToolOrchestrator:
     async def run(
         self,
         tool_uses: Sequence[ToolUseBlock],
+        allowed_tool_names: Optional[Sequence[str]] = None,
     ) -> AsyncIterator[OrchestrationUpdate]:
+        allowed = (
+            set(str(name) for name in allowed_tool_names)
+            if allowed_tool_names is not None
+            else None
+        )
         outcomes: List[Optional[ToolExecutionOutcome]] = [None] * len(tool_uses)
         for batch in partition_tool_calls(tool_uses, self.registry):
             if batch.is_concurrency_safe:
-                async for update in self._run_concurrently(batch.calls):
+                async for update in self._run_concurrently(batch.calls, allowed):
                     if isinstance(update, ToolExecutionOutcome):
                         outcomes[update.index] = update
                         yield update.event
@@ -77,7 +83,7 @@ class ToolOrchestrator:
                         tool_name=tool_use.name,
                         status="started",
                     )
-                    outcome = await self._execute_one(index, tool_use)
+                    outcome = await self._execute_one(index, tool_use, allowed)
                     outcomes[index] = outcome
                     yield outcome.event
 
@@ -89,12 +95,15 @@ class ToolOrchestrator:
     async def _run_concurrently(
         self,
         calls: Sequence[Tuple[int, ToolUseBlock]],
+        allowed_tool_names,
     ) -> AsyncIterator[Union[ToolEvent, ToolExecutionOutcome]]:
         semaphore = asyncio.Semaphore(self.max_concurrency)
 
         async def execute(index: int, tool_use: ToolUseBlock):
             async with semaphore:
-                return await self._execute_one(index, tool_use)
+                return await self._execute_one(
+                    index, tool_use, allowed_tool_names
+                )
 
         tasks = []
         for index, tool_use in calls:
@@ -118,6 +127,7 @@ class ToolOrchestrator:
         self,
         index: int,
         tool_use: ToolUseBlock,
+        allowed_tool_names=None,
     ) -> ToolExecutionOutcome:
         tool = self.registry.get(tool_use.name)
         if tool is None:
@@ -131,6 +141,16 @@ class ToolOrchestrator:
                 index,
                 tool_use,
                 "Tool is disabled: %s" % tool_use.name,
+            )
+        if (
+            allowed_tool_names is not None
+            and tool_use.name not in allowed_tool_names
+        ):
+            return self._error_outcome(
+                index,
+                tool_use,
+                "Permission denied: tool is not available in the active "
+                "agent mode: %s" % tool_use.name,
             )
 
         try:

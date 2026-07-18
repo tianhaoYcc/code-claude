@@ -116,6 +116,11 @@ def validate_input(input_schema: Dict[str, Any], data: Dict[str, Any]) -> None:
                 raise InputValidationError("Field %s has invalid type" % key)
         elif expected_type and not _schema_type_matches(value, expected_type):
             raise InputValidationError("Field %s must be %s" % (key, expected_type))
+        if "enum" in spec and value not in spec["enum"]:
+            raise InputValidationError(
+                "Field %s must be one of: %s"
+                % (key, ", ".join(str(item) for item in spec["enum"]))
+            )
 
 
 def resolve_workspace_path(workspace_root: Path, user_path: str) -> Path:
@@ -201,6 +206,8 @@ class PermissionRequest:
 
 
 PermissionCallback = Callable[[PermissionRequest], bool]
+PermissionOverride = Callable[[PermissionRequest], Optional[bool]]
+WriteContentFilter = Callable[[Path, str], str]
 
 
 @dataclass
@@ -299,6 +306,8 @@ class ToolContext:
     shell_timeout_seconds: int = 30
     shell_max_output_chars: int = 30000
     cancel_event: asyncio.Event = field(default_factory=asyncio.Event)
+    permission_override: Optional[PermissionOverride] = None
+    write_content_filter: Optional[WriteContentFilter] = None
 
     def resolve_path(self, user_path: str) -> Path:
         return resolve_workspace_path(self.workspace_root, user_path)
@@ -310,16 +319,29 @@ class ToolContext:
         path: Optional[Path] = None,
         description: str = "",
     ) -> None:
+        request = PermissionRequest(
+            action=action,
+            tool_name=tool_name,
+            path=path,
+            description=description,
+        )
+        if self.permission_override is not None:
+            override = self.permission_override(request)
+            if override is True:
+                return
+            if override is False:
+                raise PermissionError(
+                    "Permission denied by active agent mode for %s action=%s path=%s"
+                    % (tool_name, action, path or "")
+                )
         if action == "write" and self.allow_writes:
             return
-        self.permission_policy.check(
-            PermissionRequest(
-                action=action,
-                tool_name=tool_name,
-                path=path,
-                description=description,
-            )
-        )
+        self.permission_policy.check(request)
+
+    def filter_write_content(self, path: Path, content: str) -> str:
+        if self.write_content_filter is None:
+            return content
+        return self.write_content_filter(path.resolve(), content)
 
 
 class ReadFileTool(Tool):
@@ -532,7 +554,7 @@ class WriteFileTool(Tool):
                 raise ToolError("Parent directory does not exist: %s" % path.parent)
 
         old_text = path.read_text(encoding="utf-8", errors="replace") if path.exists() else ""
-        new_text = str(input_data["content"])
+        new_text = context.filter_write_content(path, str(input_data["content"]))
         path.write_text(new_text, encoding="utf-8")
         diff = make_unified_diff(old_text, new_text, path)
         return ToolResult(
@@ -585,6 +607,7 @@ class EditFileTool(Tool):
             raise ToolError("old_text was not found in file: %s" % path)
         replacements = count if replace_all else 1
         updated = original.replace(old_text, new_text, replacements)
+        updated = context.filter_write_content(path, updated)
         path.write_text(updated, encoding="utf-8")
         diff = make_unified_diff(original, updated, path)
         return ToolResult(

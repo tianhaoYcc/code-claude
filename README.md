@@ -9,12 +9,12 @@
 - [第一章 初识 agent-query 循环](coding_agent/README.md)
 - [第二章 工具执行安全机制：让 Agent 有手，但不乱动手](docs/chapter-02-tool-safety.md)
 - [第三章 上下文压缩：让 Agent 在长对话中继续工作](docs/chapter-03-context-compaction.md)
-- 第四章 记忆系统：待补充
-- 第五章 规划与复杂任务执行：待补充
+- [第四章 双层记忆：让 Agent 记得住，也压得动](docs/chapter-04-memory-system.md)
+- [第五章 Plan Mode 与子 Agent：先规划，再协作](docs/chapter-05-plan-mode-and-subagents.md)
 
 ## 当前版本
 
-当前版本覆盖前三章的基础实现：先让 agent query loop 跑起来，再补齐工具执行安全和长对话上下文压缩。
+当前版本覆盖前五章的基础实现：先让 agent query loop 跑起来，再补齐工具执行安全、长对话上下文压缩、双层记忆、Plan mode 和前台子 Agent 协作。
 
 它已经支持：
 
@@ -36,6 +36,15 @@
 - 完整 transcript 与模型活跃上下文分离
 - microcompact 旧工具结果、完整摘要和 compact boundary
 - 自动压缩、手动压缩、prompt-too-long 恢复和三次失败熔断
+- `summary.md` 会话滚动检查点和 session-memory compact 优先路径
+- `MEMORY.md` 长期索引、topic 文件和最多 3 个相关 topic 的确定性召回
+- 隔离的 session/durable memory 子 QueryLoop、受限工具注册表和后台任务合并
+- UUID 增量游标、resume 恢复、原子状态写入、敏感信息过滤和失败降级
+- `MemoryEvent` 事件流，以及 CLI 退出前的 Worker flush
+- `execute` / `plan` 模式切换、计划落盘、批准/拒绝和 resume 恢复
+- Plan mode 只允许修改当前 session 的 `plan.md`，并在执行前复查工具可见性和路径权限
+- `explore`、`plan`、`general-purpose` 三类前台子 Agent，以及独立 QueryLoop 和 transcript
+- 只读子 Agent 有界并发、通用子 Agent 串行、取消传播、超时和错误降级
 - 单元测试覆盖核心路径
 
-后续章节会继续补记忆系统、Plan mode、子 agent、MCP 和 ToolSearch。
+后续章节会继续补后台 Agent、任务列表与 DAG、Agent resume、worktree、MCP 和 ToolSearch。

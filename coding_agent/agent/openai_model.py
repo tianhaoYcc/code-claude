@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import ssl
@@ -97,7 +98,8 @@ class OpenAICompatibleModelClient(ModelClient):
         if tools:
             payload["tools"] = [tool_to_openai_schema(tool) for tool in tools]
             payload["tool_choice"] = "auto"
-        data = self._post_chat_completion(payload)
+        loop = asyncio.get_running_loop()
+        data = await loop.run_in_executor(None, self._post_chat_completion, payload)
         yield assistant_from_openai_response(data)
 
     def _post_chat_completion(self, payload: Dict[str, Any]) -> Dict[str, Any]:
@@ -215,12 +217,13 @@ def find_env_file(env_file: Optional[Path] = None) -> Optional[Path]:
 
 
 def tool_to_openai_schema(tool: Tool) -> Dict[str, Any]:
+    schema = tool.schema_for_model()
     return {
         "type": "function",
         "function": {
-            "name": tool.name,
-            "description": tool.description,
-            "parameters": tool.input_schema,
+            "name": schema["name"],
+            "description": schema["description"],
+            "parameters": schema["input_schema"],
         },
     }
 

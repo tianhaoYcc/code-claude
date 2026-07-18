@@ -241,7 +241,7 @@ cd /d "E:\code claude\coding_agent"
 - 没有精确 tokenizer，当前是 usage 加保守估算。
 - 没有恢复 read file cache、plan mode、skill、MCP、异步 agent 等 post-compact attachments。
 - 没有 PreCompact / SessionStart hooks。
-- 没有 session memory compact 或更细粒度的 context collapse。
+- 更细粒度的 context collapse、图片压缩和缓存编辑块仍未实现；session-memory compact 已在第四章补齐。
 - microcompact 当前不处理图片、文档和缓存编辑块。
 
-但主线已经完整：完整历史不丢、模型视图可压缩、工具协议不被拆开、压缩可恢复、失败有上限。下一章可以在这个基础上实现文件化记忆系统，让“当前会话的上下文”与“跨会话长期知识”正式分层。
+但主线已经完整：完整历史不丢、模型视图可压缩、工具协议不被拆开、压缩可恢复、失败有上限。下一步见 [第四章 双层记忆](chapter-04-memory-system.md)：把“当前会话的压缩检查点”与“跨会话长期知识”正式分层。

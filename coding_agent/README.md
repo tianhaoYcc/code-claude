@@ -2,7 +2,7 @@
 
 这一章只做一件事：把 Claude Code 最核心的 agent query 循环拆出来，用 Python 写一个小而完整的版本。
 
-它不是完整 Claude Code，也不追求 UI、插件、MCP、子 agent 一步到位。当前目标是先讲清楚：
+它不是完整 Claude Code，也不追求 UI、插件和 MCP 一步到位。当前目标是先讲清楚：
 
 ```text
 用户输入
@@ -69,6 +69,26 @@ cd /d "E:\code claude\coding_agent"
 
 完整机制见 [第三章 上下文压缩](../docs/chapter-03-context-compaction.md)。
 
+CLI 默认启用双层记忆：长期索引写入 `.agent_memory/MEMORY.md`，当前会话检查点写入 `.agent_memory/sessions/<session-id>/summary.md`。可以使用 `--no-memory` 关闭，或用 `--memory-model-id` 给记忆 Worker 指定独立模型。完整机制见 [第四章 双层记忆](../docs/chapter-04-memory-system.md)。
+
+CLI 默认同时启用 Plan mode 和子 Agent。使用 `--plan` 可以由用户直接进入规划模式，不重复询问是否进入；模型也可以在执行模式中调用 `enter_plan_mode`：
+
+```powershell
+cd /d "E:\code claude\coding_agent"
+& "E:\Anconda\python.exe" -m agent.cli "请先调研 query loop，再给出实施计划，不要直接修改项目" --workspace . --model-client openai --plan --write-permission ask --shell-permission ask
+```
+
+Plan mode 中，模型只能把 `write_file` / `edit_file` 用于当前 session 的 `.agent_plans/<session-id>/plan.md`。计划完成后必须调用 `exit_plan_mode`；CLI 会展示计划并请求批准。批准后回到执行模式，拒绝反馈则作为对应的 `tool_result` 返回模型继续修订。
+
+复杂调研可以让主 Agent 委派多个只读子 Agent：
+
+```powershell
+cd /d "E:\code claude\coding_agent"
+& "E:\Anconda\python.exe" -m agent.cli "请在规划阶段并行调用 explore 和 plan 子 Agent，分析这个项目下一步如何实现任务系统" --workspace . --model-client openai --plan --max-subagents 3 --subagent-max-turns 8
+```
+
+`--subagent-model-id` 可以给子 Agent 指定独立模型；未传时依次读取 `LLM_SUBAGENT_MODEL_ID` 并回退到主模型。`--no-plan-mode` 和 `--no-subagents` 可以分别关闭两项能力。完整机制见 [第五章 Plan Mode 与子 Agent](../docs/chapter-05-plan-mode-and-subagents.md)。
+
 也可以直接运行入口文件，不依赖 `-m agent.cli` 的包路径：
 
 ```powershell
@@ -91,6 +111,10 @@ cd /d "E:\code claude\coding_agent"
 - `agent/mock_model.py`：脚本化和启发式 mock 模型客户端。
 - `agent/openai_model.py`：OpenAI-compatible Chat Completions 适配器。
 - `agent/context_manager.py`：token 预算、上下文投影、microcompact、摘要压缩和恢复边界。
+- `agent/memory.py`：记忆配置、存储格式、UUID 游标、敏感信息过滤和长期记忆召回。
+- `agent/memory_manager.py`：隔离的 session/durable Worker、后台任务合并、超时与失败降级。
+- `agent/plan_mode.py`：Plan mode 状态机、计划存储、审批、模式提示词和运行时工具。
+- `agent/subagents.py`：内置子 Agent 定义、独立 QueryLoop、并发、取消、超时和结果回传。
 - `agent/tools.py`：文件工具、路径保护、输入校验、权限策略、diff 输出和工具结果预算。
 - `agent/tool_registry.py`：动态工具注册、启用/禁用和模型可见工具过滤。
 - `agent/tool_orchestration.py`：只读并发、变更串行、工具事件和结果顺序保证。
@@ -247,12 +271,14 @@ Claude Code 用 append-only JSONL transcript 保存会话，并在 resume 时重
 
 还没有实现：
 
-- 记忆系统
+- embedding/向量数据库和跨 workspace 全局记忆
 - ToolSearch
 - MCP 工具发现与动态加载
 - 操作系统级 Shell sandbox 和完整 PowerShell AST 校验
 - 更完整的权限确认 UI 与权限持久化
-- Plan mode
-- 子 agent
+- 后台子 Agent、子 Agent resume 和嵌套 Agent
+- 任务列表、任务 DAG 和 Agent ownership
+- worktree 隔离与并行写入
+- 自定义 Agent 文件和插件 Agent
 
 这些会放到后续章节继续补。

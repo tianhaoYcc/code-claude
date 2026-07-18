@@ -2,21 +2,31 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import os
 from pathlib import Path
 from uuid import uuid4
 
 from .context_manager import ContextConfig
+from .memory import MemoryConfig
 from .mock_model import HeuristicMockModelClient
 from .models import (
     AssistantMessage,
     CompactionEvent,
+    MemoryEvent,
+    PlanEvent,
     RequestStartEvent,
     TerminalResult,
     ToolEvent,
     UserMessage,
 )
 from .openai_model import OpenAICompatibleModelClient
+from .plan_mode import (
+    PlanApprovalDecision,
+    PlanApprovalRequest,
+    PlanConfig,
+)
 from .query_loop import QueryLoop, QueryLoopConfig
+from .subagents import SubagentConfig
 from .tools import PermissionRequest
 from .transcript import Transcript
 
@@ -142,6 +152,60 @@ def build_parser() -> argparse.ArgumentParser:
         default=4,
         help="Number of recent tool results excluded from microcompact.",
     )
+    parser.add_argument(
+        "--no-memory",
+        action="store_false",
+        dest="memory_enabled",
+        help="Disable session and durable memory for this run.",
+    )
+    parser.set_defaults(memory_enabled=True)
+    parser.add_argument(
+        "--memory-root",
+        default=None,
+        help="Memory directory under the workspace. Defaults to .agent_memory.",
+    )
+    parser.add_argument(
+        "--memory-model-id",
+        default=None,
+        help="Optional model id for memory workers. Falls back to LLM_MEMORY_MODEL_ID then the main model.",
+    )
+    plan_group = parser.add_mutually_exclusive_group()
+    plan_group.add_argument(
+        "--plan",
+        action="store_true",
+        help="Start this session directly in plan mode.",
+    )
+    plan_group.add_argument(
+        "--no-plan-mode",
+        action="store_false",
+        dest="plan_enabled",
+        help="Disable EnterPlanMode and ExitPlanMode tools.",
+    )
+    parser.set_defaults(plan_enabled=True)
+    parser.add_argument(
+        "--no-subagents",
+        action="store_false",
+        dest="subagents_enabled",
+        help="Disable the foreground agent delegation tool.",
+    )
+    parser.set_defaults(subagents_enabled=True)
+    parser.add_argument(
+        "--subagent-model-id",
+        default=None,
+        help="Optional subagent model id. Falls back to LLM_SUBAGENT_MODEL_ID then the main model.",
+    )
+    parser.add_argument(
+        "--subagent-max-turns",
+        type=int,
+        default=8,
+        help="Maximum turns for each foreground subagent.",
+    )
+    parser.add_argument(
+        "--max-subagents",
+        type=int,
+        default=3,
+        help="Maximum concurrently running read-only subagents.",
+    )
     return parser
 
 
@@ -159,6 +223,30 @@ def build_model_client(args: argparse.Namespace):
         raise
 
 
+def build_memory_model_client(args: argparse.Namespace, main_model):
+    model_id = args.memory_model_id or os.environ.get("LLM_MEMORY_MODEL_ID")
+    if not isinstance(main_model, OpenAICompatibleModelClient):
+        return main_model
+    return OpenAICompatibleModelClient(
+        api_key=main_model.api_key,
+        model_id=str(model_id or main_model.model_id),
+        base_url=main_model.base_url,
+        timeout_seconds=min(main_model.timeout_seconds, 15.0),
+    )
+
+
+def build_subagent_model_client(args: argparse.Namespace, main_model):
+    model_id = args.subagent_model_id or os.environ.get("LLM_SUBAGENT_MODEL_ID")
+    if not isinstance(main_model, OpenAICompatibleModelClient):
+        return main_model
+    return OpenAICompatibleModelClient(
+        api_key=main_model.api_key,
+        model_id=str(model_id or main_model.model_id),
+        base_url=main_model.base_url,
+        timeout_seconds=main_model.timeout_seconds,
+    )
+
+
 def ask_permission(request: PermissionRequest) -> bool:
     print(
         "[permission] tool=%s action=%s path=%s %s"
@@ -173,6 +261,20 @@ def ask_permission(request: PermissionRequest) -> bool:
     return answer in ("y", "yes")
 
 
+def ask_plan_approval(request: PlanApprovalRequest) -> PlanApprovalDecision:
+    if request.kind == "enter":
+        answer = input("Enter plan mode? [y/N] ").strip().lower()
+        return PlanApprovalDecision(answer in ("y", "yes"))
+
+    print("\n[plan] file:", request.plan_path)
+    print(request.plan_content)
+    answer = input("Approve this plan and start implementation? [y/N] ").strip().lower()
+    if answer in ("y", "yes"):
+        return PlanApprovalDecision(True)
+    feedback = input("Plan feedback (optional): ").strip()
+    return PlanApprovalDecision(False, feedback)
+
+
 async def run_cli(args: argparse.Namespace) -> int:
     workspace = Path(args.workspace).resolve()
     session_path = (
@@ -182,8 +284,9 @@ async def run_cli(args: argparse.Namespace) -> int:
     )
     transcript = Transcript(session_path)
     initial_messages = transcript.load_messages(strict=True) if args.resume else []
+    model_client = build_model_client(args)
     loop = QueryLoop(
-        model_client=build_model_client(args),
+        model_client=model_client,
         workspace_root=workspace,
         transcript=transcript,
         config=QueryLoopConfig(
@@ -207,19 +310,40 @@ async def run_cli(args: argparse.Namespace) -> int:
                     args.microcompact_keep_tool_results
                 ),
             ),
+            memory=MemoryConfig(
+                enabled=args.memory_enabled,
+                root=Path(args.memory_root) if args.memory_root else None,
+            ),
+            plan=PlanConfig(
+                enabled=args.plan_enabled,
+                initial_mode="plan" if args.plan else "execute",
+                approval_callback=ask_plan_approval,
+            ),
+            subagents=SubagentConfig(
+                enabled=args.subagents_enabled,
+                max_turns=args.subagent_max_turns,
+                max_concurrency=args.max_subagents,
+            ),
         ),
         initial_messages=initial_messages,
+        memory_model_client=build_memory_model_client(args, model_client),
+        subagent_model_client=build_subagent_model_client(args, model_client),
+        session_id=session_path.stem,
     )
 
-    if args.compact:
-        async for event in loop.compact(trigger="manual"):
-            print_event(event)
-        if not args.prompt:
-            print("transcript:", session_path)
-            return 0
+    try:
+        if args.compact:
+            async for event in loop.compact(trigger="manual"):
+                print_event(event)
+            if not args.prompt:
+                print("transcript:", session_path)
+                return 0
 
-    async for event in loop.run(args.prompt):
-        print_event(event)
+        async for event in loop.run(args.prompt):
+            print_event(event)
+    finally:
+        for event in await loop.aclose():
+            print_event(event)
 
     print("transcript:", session_path)
     return 0
@@ -250,6 +374,22 @@ def print_event(event) -> None:
                 event.trigger,
                 event.before_tokens,
                 event.after_tokens,
+                event.message or "",
+            )
+        )
+    elif isinstance(event, MemoryEvent):
+        print(
+            "[memory] %s %s %s"
+            % (event.kind, event.status, event.message or "")
+        )
+    elif isinstance(event, PlanEvent):
+        print(
+            "[plan] %s mode=%s version=%d approved=%d %s"
+            % (
+                event.status,
+                event.mode,
+                event.plan_version,
+                event.approved_version,
                 event.message or "",
             )
         )

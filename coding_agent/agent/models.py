@@ -350,6 +350,50 @@ class CompactionEvent:
 
 
 @dataclass
+class MemoryEvent:
+    kind: str
+    status: str
+    session_id: str
+    from_uuid: Optional[str] = None
+    to_uuid: Optional[str] = None
+    message: str = ""
+    type: str = field(init=False, default="memory_event")
+
+    def to_record(self) -> Dict[str, Any]:
+        return {
+            "type": self.type,
+            "kind": self.kind,
+            "status": self.status,
+            "session_id": self.session_id,
+            "from_uuid": self.from_uuid,
+            "to_uuid": self.to_uuid,
+            "message": self.message,
+        }
+
+
+@dataclass
+class PlanEvent:
+    status: str
+    session_id: str
+    mode: str
+    plan_version: int = 0
+    approved_version: int = 0
+    message: str = ""
+    type: str = field(init=False, default="plan_event")
+
+    def to_record(self) -> Dict[str, Any]:
+        return {
+            "type": self.type,
+            "status": self.status,
+            "session_id": self.session_id,
+            "mode": self.mode,
+            "plan_version": self.plan_version,
+            "approved_version": self.approved_version,
+            "message": self.message,
+        }
+
+
+@dataclass
 class TerminalResult:
     reason: str
     turn_count: int
@@ -371,6 +415,8 @@ AgentEvent = Union[
     RequestStartEvent,
     ToolEvent,
     CompactionEvent,
+    MemoryEvent,
+    PlanEvent,
     TerminalResult,
     Message,
 ]
